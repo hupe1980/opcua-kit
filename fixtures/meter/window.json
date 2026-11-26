@@ -1,0 +1,23 @@
+{
+  "meter": {
+    "device": "example-grid-incomer",
+    "applicationUri": "urn:example:grid-meter",
+    "node": {
+      "namespace": "urn:example:meter",
+      "id": "s=GridImportWh"
+    }
+  },
+  "start": "2026-10-25T02:45:00+02:00",
+  "end": "2026-10-25T02:15:00+01:00",
+  "tolerance_wh": 1,
+  "closed": [
+    {
+      "at": "2026-10-25T02:45:00+02:00",
+      "wh": 285000
+    },
+    {
+      "at": "2026-10-25T02:00:00+01:00",
+      "wh": 274999
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish crate
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      stable: ${{ steps.package.outputs.stable }}
+      sha256: ${{ steps.archive.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag and registry
+        id: package
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 |
+            jq -er '.packages[] | select(.name == "opcua-kit") | .version')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag must match the package version v$version"
+            exit 1
+          fi
+          # The reserved opcua-kit name already has a sparse-index entry.
+          published=$(curl -fsSL --retry 3 https://index.crates.io/op/cu/opcua-kit |
+            jq -sr --arg v "$version" '
+              if any(.[]; .vers == $v and .yanked) then error("version is yanked")
+              else any(.[]; .vers == $v) end')
+          stable=false
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then stable=true; fi
+          {
+            echo "version=$version"
+            echo "stable=$stable"
+            echo "published=$published"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install native build dependencies
+        if: steps.package.outputs.published == 'false'
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+
+      - name: Exchange GitHub identity for a crates.io token
+        if: steps.package.outputs.published == 'false'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish to crates.io
+        if: steps.package.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --all-features --registry crates-io
+
+      - name: Verify the published revision and checksum the download
+        id: archive
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          crate="opcua-kit-$VERSION"
+          archive="$RUNNER_TEMP/$crate.crate"
+          curl -fsSL --retry 5 --retry-all-errors \
+            "https://static.crates.io/crates/opcua-kit/$crate.crate" -o "$archive"
+          # On a rerun, only reuse a published version from this exact commit.
+          revision=$(tar -xzOf "$archive" "$crate/.cargo_vcs_info.json" | jq -er '.git.sha1')
+          if [[ "$revision" != "$(git rev-parse HEAD)" ]]; then
+            echo "::error::Published $crate was built from a different commit"
+            exit 1
+          fi
+          sha256sum "$archive" | awk '{print "sha256=" $1}' >> "$GITHUB_OUTPUT"
+
+  tap:
+    name: Test and publish Homebrew formula
+    needs: publish
+    if: needs.publish.outputs.stable == 'true'
+    runs-on: macos-latest
+    environment: homebrew
+    concurrency:
+      group: homebrew-opcua-kit
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.publish.outputs.version }}
+      SHA256: ${{ needs.publish.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install and test the release candidate
+        run: |
+          brew tap-new --no-git local/candidate
+          formula="$(brew --repository local/candidate)/Formula/opcua-kit.rb"
+          sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" \
+            packaging/homebrew/opcua-kit.rb.in > "$formula"
+          brew trust --formula local/candidate/opcua-kit
+          brew install --build-from-source local/candidate/opcua-kit
+          brew test local/candidate/opcua-kit
+
+      - name: Authenticate to the tap
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app.outputs.token }}
+          path: tap
+
+      - name: Update Formula/opcua-kit.rb
+        working-directory: tap
+        run: |
+          formula=Formula/opcua-kit.rb
+          if [[ -f "$formula" ]]; then
+            previous=$(sed -n 's/^  version "\([^"]*\)"$/\1/p' "$formula")
+            if [[ -z "$previous" ]]; then
+              echo "::error::Cannot determine the current tap version"
+              exit 1
+            fi
+            if ruby -e 'exit(Gem::Version.new(ARGV[0]) > Gem::Version.new(ARGV[1]) ? 0 : 1)' "$previous" "$VERSION"; then
+              echo "Tap already serves newer version $previous"
+              exit 0
+            fi
+          fi
+          mkdir -p Formula
+          cp "$(brew --repository local/candidate)/$formula" "$formula"
+          git add -- "$formula"
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name "opcua-kit release"
+          git config user.email "opcua-kit-release@users.noreply.github.com"
+          git commit -m "opcua-kit $VERSION"
+          git push

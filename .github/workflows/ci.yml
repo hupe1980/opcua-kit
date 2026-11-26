@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - run: python3 contrib/verify-backend.py
+      - run: cargo install cargo-audit --locked --version 0.22.1
+      - run: cargo audit --deny warnings
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo +1.88.0 test --locked --all-features
+      - run: cargo test --locked
+      - run: cargo test --locked --all-features
+      - run: cargo test --locked --no-default-features
+      - run: cargo test --locked --no-default-features --features commissioning
+      - run: cargo test --locked --features cli
+      - run: cargo test --locked --no-default-features --features cems
+      - run: cargo test --locked --no-default-features --features pubsub
+      - run: cargo test --locked --no-default-features --features server
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo doc --locked --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+      - run: rustup target add thumbv7em-none-eabihf
+      - run: cargo check --locked --lib --no-default-features --target thumbv7em-none-eabihf
+      - run: cargo check --locked --lib --no-default-features --features pubsub --target thumbv7em-none-eabihf
+  interop:
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --isolated --no-config --no-project --with asyncua==2.1.0 --python 3.13 python tests/capture_limits.py
+      - run: tests/peers/run.sh
+      - run: bash tests/peers/recovery.sh
+      - run: bash tests/peers/protocol.sh
+      - run: bash tests/peers/protocol.sh control
+      - run: bash tests/peers/protocol.sh observe
+      - run: bash tests/peers/protocol.sh conditions
+      - run: bash tests/peers/protocol.sh republish
+      - run: cargo build --locked --no-default-features --features server,pubsub --example local_server --example uadp
+      - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/local_server.py target/debug/examples/local_server
+      - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/secure_server.py target/debug/examples/local_server
+      - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/uadp.py target/debug/examples/uadp
+      - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/field_commands.py target/debug/opcua-kit
+      - name: Verify packaged SDK, offline library and CLI
+        run: python3 tests/verify_package.py
+      - name: Verify event delivery with the registry backend from the archive
+        run: |
+          archive=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; m=json.load(sys.stdin); p=m["packages"][0]; print("{}/package/{}-{}".format(m["target_directory"],p["name"],p["version"]))')
+          cd "$archive"
+          bash tests/peers/protocol.sh observe
+          bash tests/peers/protocol.sh republish

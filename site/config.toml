@@ -1,0 +1,11 @@
+base_url = "https://hupe1980.github.io/opcua-kit"
+title = "opcua-kit"
+description = "Embed OPC UA client, server and PubSub roles in Rust applications"
+compile_sass = false
+
+[extra]
+guide_groups = ["Embed the library", "Commission a device", "Application guides"]
+
+[markdown.highlighting]
+theme = "github-dark"
+error_on_missing_language = true

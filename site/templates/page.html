@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block body %}
+{% set root = get_section(path="_index.md") %}
+<div class="wrap guide-layout">
+  <aside class="guide-nav"><nav aria-label="Guides"><a class="directory" href="{{ get_url(path='@/documentation.md') }}">Documentation</a>
+    {% for group in config.extra.guide_groups %}<h2>{{ group }}</h2><ul>
+      {% for guide in root.pages %}{% if guide.extra.group and guide.extra.group == group %}<li><a href="{{ guide.permalink }}"{% if guide.path == page.path %} aria-current="page"{% endif %}>{{ guide.title }}</a></li>{% endif %}{% endfor %}
+    </ul>{% endfor %}</nav>
+  </aside>
+  <article class="prose">
+    <div class="breadcrumbs"><a href="{{ get_url(path='@/documentation.md') }}">Documentation</a><span aria-hidden="true">/</span>{{ page.extra.group }}</div>
+    <h1>{{ page.title }}</h1>
+    {% if page.toc %}<details class="mobile-toc"><summary>On this page</summary><ul>{% for h in page.toc %}<li><a href="#{{ h.id }}">{{ h.title }}</a></li>{% endfor %}</ul></details>{% endif %}
+    {{ page.content | replace(from="<pre ", to='<pre tabindex="0" ') | replace(from="<pre>", to='<pre tabindex="0">') | safe }}
+    <div class="article-end"><a href="{{ get_url(path='@/documentation.md') }}">Browse all guides</a></div>
+  </article>
+  {% if page.toc %}<aside class="toc"><nav aria-label="On this page"><h2>On this page</h2><ul>{% for h in page.toc %}<li><a href="#{{ h.id }}">{{ h.title }}</a></li>{% endfor %}</ul></nav></aside>{% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "device": "ahu-01",
+  "applicationUri": "urn:opcua-kit:fixture",
+  "principal": "anonymous",
+  "signals": [
+    {
+      "name": "SupplyTemp",
+      "node": {
+        "namespace": "urn:fixture:hvac",
+        "id": "s=SupplyTemp"
+      },
+      "dataType": {
+        "namespace": "http://opcfoundation.org/UA/",
+        "id": "i=11"
+      },
+      "engineeringUnits": {
+        "namespaceUri": "http://www.opcfoundation.org/UA/units/un/cefact",
+        "unitId": 4408652
+      }
+    }
+  ]
+}

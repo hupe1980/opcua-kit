@@ -1,0 +1,892 @@
+use std::{
+    ffi::c_void,
+    slice,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU8, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+
+use futures_channel::oneshot;
+use open62541_sys::{
+    __UA_Client_AsyncService, UA_Client, UA_Client_disconnectAsync, UA_Client_run_iterate,
+    UA_STATUSCODE_BADCONNECTIONCLOSED, UA_STATUSCODE_BADCONNECTIONREJECTED,
+    UA_STATUSCODE_BADDISCONNECT, UA_UInt32,
+};
+
+use crate::{
+    AsyncSubscription, Attribute, BrowseResult, CallbackOnce, DataType, DataValue, Error, Result,
+    ServiceRequest, ServiceResponse, SubscriptionBuilder, ua,
+};
+
+/// Timeout for `UA_Client_run_iterate()`.
+///
+/// This is the maximum amount of time that `UA_Client_run_iterate()` will block for. It is relevant
+/// primarily when cancelling the background task, i.e. when we interrupt the loop and cancel before
+/// the next invocation of `UA_Client_run_iterate()`.
+///
+/// Since this is also the timeout we must block for when dropping the client without `disconnect()`
+/// first, the value should not be too large. On the other hand, it should not be too small to avoid
+/// repeatedly calling `poll()`/`select()` inside open62541's event loop implementation.
+const RUN_ITERATE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Connected OPC UA client (with asynchronous API).
+///
+/// To disconnect, prefer method [`disconnect()`](Self::disconnect) over simply dropping the client:
+/// disconnecting involves server communication and might take a short amount of time. If the client
+/// is dropped when still connected, it will _synchronously_ clean up after itself, thereby blocking
+/// while being dropped. In most cases, this is not the desired behavior.
+///
+/// With feature `tokio` enabled, blocking invocations in [`AsyncClient::drop()`] might be offloaded
+/// from runtime to worker threads as needed to prevent deadlocks. However, this can be implemented
+/// only when running in [multi-threaded runtimes]. When using current-thread runtime (or some other
+/// asynchronous runtime), make sure to not invoke [`AsyncClient::drop()`] in asynchronous contexts.
+///
+/// See [Client](crate::Client) for more details.
+///
+/// [multi-threaded runtimes]: https://docs.rs/tokio/latest/tokio/runtime/index.html
+#[derive(Debug)]
+pub struct AsyncClient {
+    // Use an `Arc` to access the client from here (the handle struct) and the background thread.
+    client: Arc<ua::Client>,
+    background_thread: Option<BackgroundThread>,
+}
+
+impl AsyncClient {
+    /// Creates default client connected to endpoint.
+    ///
+    /// If you need more control over the initialization, use [`ClientBuilder`] instead, and turn it
+    /// into [`Client`](crate::Client) by calling [`connect()`](crate::ClientBuilder::connect), then
+    /// follow this with [`into_async()`](crate::Client::into_async) to get the asynchronous API.
+    ///
+    /// # Errors
+    ///
+    /// See [`ClientBuilder::connect()`] and [`Client::into_async()`](crate::Client::into_async).
+    ///
+    /// # Panics
+    ///
+    /// See [`ClientBuilder::connect()`].
+    ///
+    /// [`ClientBuilder`]: crate::ClientBuilder
+    /// [`ClientBuilder::connect()`]: crate::ClientBuilder::connect
+    pub fn new(endpoint_url: &str) -> Result<Self> {
+        Ok(crate::Client::new(endpoint_url)?.into_async())
+    }
+
+    pub(crate) fn from_sync(client: ua::Client) -> Self {
+        let client = Arc::new(client);
+        let background_thread = BackgroundThread::spawn(Arc::clone(&client));
+        Self {
+            client,
+            background_thread: Some(background_thread),
+        }
+    }
+
+    pub(crate) fn upgrade_weak(client: &Weak<ua::Client>) -> Result<Arc<ua::Client>> {
+        client
+            .upgrade()
+            .ok_or(Error::internal("client has been dropped"))
+    }
+
+    /// Gets current channel and session state, and connect status.
+    #[must_use]
+    pub fn state(&self) -> ua::ClientState {
+        self.client.state()
+    }
+
+    /// Disconnects from endpoint.
+    ///
+    /// This consumes the client and handles the graceful shutdown of the connection. This should be
+    /// preferred over simply dropping the instance to give the server a chance to clean up and also
+    /// to avoid blocking unexpectedly when the client is being dropped without calling this method.
+    #[expect(clippy::missing_panics_doc, reason = "implementation invariant")]
+    pub async fn disconnect(mut self) {
+        log::info!("Disconnecting from endpoint");
+
+        // PANIC: We only take the background thread here and in `drop()` (but that cannot have been
+        // called yet). Since the method consumes `self`, the value must still be present. Note that
+        // we take the value just before `await`, to uphold invariant in `Drop` implementation which
+        // allows us to take an early return path there.
+        let background_thread = self.background_thread.take().expect("no background thread");
+
+        // The background thread has not been cancelled yet, because it is only cancelled here
+        // or in drop(). It doesn't terminate and finish on its own before being cancelled.
+        debug_assert!(background_thread.is_running_and_not_finished_yet());
+
+        let status_code = ua::StatusCode::new(unsafe {
+            UA_Client_disconnectAsync(
+                // SAFETY: Cast to `mut` pointer, function is marked `UA_THREADSAFE`.
+                self.client.as_ptr().cast_mut(),
+            )
+        });
+        if let Err(error) = Error::verify_good(&status_code) {
+            log::warn!("Error while disconnecting client: {error}");
+        }
+
+        // Asynchronously wait for the background task running in the background thread to complete.
+        //
+        // Note: We first request graceful cancellation before blocking. The
+        // `TerminateAfterNotConnected` mode keeps the asynchronous handling running until the
+        // connection has been taken down, at which point the background task can finish and we wait
+        // for that completion here.
+        background_thread.cancel(BackgroundTaskCancellationMode::TerminateAfterNotConnected);
+        background_thread.join_after_cancelled().await;
+    }
+
+    /// Reads node value.
+    ///
+    /// To read other attributes, see [`read_attribute()`], [`read_attributes()`], and
+    /// [`read_many_attributes()`].
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails (e.g. communication error). When the node does
+    /// not exist or its value attribute cannot be read, the server returns a [`DataValue`] with the
+    /// appropriate [`status()`] and with [`value()`] unset.
+    ///
+    /// [`read_attribute()`]: Self::read_attribute
+    /// [`read_attributes()`]: Self::read_attributes
+    /// [`read_many_attributes()`]: Self::read_many_attributes
+    /// [`status()`]: DataValue::status
+    /// [`value()`]: DataValue::value
+    pub async fn read_value(&self, node_id: &ua::NodeId) -> Result<DataValue<ua::Variant>> {
+        self.read_attribute(node_id, ua::AttributeId::VALUE_T).await
+    }
+
+    /// Reads node attribute.
+    ///
+    /// To read only the value attribute, you can also use [`read_value()`].
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails (e.g. communication error). When the node does
+    /// not exist or the given attribute cannot be read, the server returns a [`DataValue`] with the
+    /// appropriate [`status()`] and with [`value()`] unset.
+    ///
+    /// [`read_value()`]: Self::read_value
+    /// [`status()`]: DataValue::status
+    /// [`value()`]: DataValue::value
+    pub async fn read_attribute<T: Attribute>(
+        &self,
+        node_id: &ua::NodeId,
+        attribute: T,
+    ) -> Result<DataValue<T::Value>> {
+        let mut values = self.read_attributes(node_id, &[attribute.id()]).await?;
+
+        // ERROR: We give a slice with one item to `read_attributes()` and expect a single result
+        // value.
+        debug_assert_eq!(values.len(), 1);
+        let Some(value) = values.pop() else {
+            return Err(Error::internal("should contain exactly one attribute"));
+        };
+
+        Ok(value.cast())
+    }
+
+    /// Reads several node attributes.
+    ///
+    /// The size and order of the result list matches the size and order of the given attribute ID
+    /// list.
+    ///
+    /// To read only a single attribute, you can also use [`read_attribute()`].
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails (e.g. communication error). When the node does
+    /// not exist or one of the given attributes cannot be read, the server returns a corresponding
+    /// [`DataValue`] with the appropriate [`status()`] and with [`value()`] unset.
+    ///
+    /// [`read_attribute()`]: Self::read_attribute
+    /// [`status()`]: DataValue::status
+    /// [`value()`]: DataValue::value
+    pub async fn read_attributes(
+        &self,
+        node_id: &ua::NodeId,
+        attribute_ids: &[ua::AttributeId],
+    ) -> Result<Vec<DataValue<ua::Variant>>> {
+        // TODO: Avoid cloning, use `AsRef` in `read_many_attributes()`?
+        self.read_many_attributes(
+            &attribute_ids
+                .iter()
+                .map(|attribute_id| (node_id.clone(), attribute_id.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+
+    /// Reads a combination of node attributes.
+    ///
+    /// The size and order of the result list matches the size and order of the given node ID and
+    /// attribute ID list.
+    ///
+    /// To read attributes of a single node, you can also use [`read_attributes()`].
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails (e.g. communication error). When a node does
+    /// not exist or one of the given attributes cannot be read, the server returns a corresponding
+    /// [`DataValue`] with the appropriate [`status()`] and with [`value()`] unset.
+    ///
+    /// [`read_attributes()`]: Self::read_attributes
+    /// [`status()`]: DataValue::status
+    /// [`value()`]: DataValue::value
+    pub async fn read_many_attributes(
+        &self,
+        node_attributes: &[(ua::NodeId, ua::AttributeId)],
+    ) -> Result<Vec<DataValue<ua::Variant>>> {
+        let nodes_to_read = node_attributes
+            .iter()
+            .map(|(node_id, attribute_id)| {
+                ua::ReadValueId::init()
+                    .with_node_id(node_id)
+                    .with_attribute_id(attribute_id)
+            })
+            .collect::<Vec<_>>();
+
+        let request = ua::ReadRequest::init()
+            // TODO: Add method argument for this? We return timestamps in `DataValue` and they
+            // should not end up always being `None` by default.
+            .with_timestamps_to_return(&ua::TimestampsToReturn::BOTH)
+            .with_nodes_to_read(&nodes_to_read);
+
+        let response = self.service_request(request).await?;
+
+        let Some(mut results) = response.results() else {
+            return Err(Error::internal("read should return results"));
+        };
+
+        let results = results
+            .drain_all()
+            .map(ua::DataValue::cast)
+            .collect::<Vec<DataValue<ua::Variant>>>();
+
+        // The OPC UA specification state that the resulting list has the same number of elements as
+        // the request list. If not, we would not be able to match elements in the two lists anyway.
+        if results.len() != node_attributes.len() {
+            return Err(Error::internal("unexpected number of read results"));
+        }
+
+        Ok(results)
+    }
+
+    /// Writes node value.
+    ///
+    /// # Errors
+    ///
+    /// This fails when the node does not exist or its value attribute cannot be written.
+    pub async fn write_value(&self, node_id: &ua::NodeId, value: &ua::DataValue) -> Result<()> {
+        let attribute_id = ua::AttributeId::VALUE;
+
+        let request = ua::WriteRequest::init().with_nodes_to_write(&[ua::WriteValue::init()
+            .with_node_id(node_id)
+            .with_attribute_id(&attribute_id)
+            .with_value(value)]);
+
+        let response = self.service_request(request).await?;
+
+        let Some(results) = response.results() else {
+            return Err(Error::internal("write should return results"));
+        };
+
+        let Some(result) = results.as_slice().first() else {
+            return Err(Error::internal("write should return a result"));
+        };
+
+        Error::verify_good(result)?;
+
+        Ok(())
+    }
+
+    /// Calls specific method node at object node.
+    ///
+    /// # Errors
+    ///
+    /// This fails when the object or method node does not exist, the method cannot be called, or
+    /// the input arguments are unexpected.
+    pub async fn call_method(
+        &self,
+        object_id: &ua::NodeId,
+        method_id: &ua::NodeId,
+        input_arguments: &[ua::Variant],
+    ) -> Result<Vec<ua::Variant>> {
+        let request =
+            ua::CallRequest::init().with_methods_to_call(&[ua::CallMethodRequest::init()
+                .with_object_id(object_id)
+                .with_method_id(method_id)
+                .with_input_arguments(input_arguments)]);
+
+        let response = self.service_request(request).await?;
+
+        let Some(results) = response.results() else {
+            return Err(Error::internal("call should return results"));
+        };
+
+        let Some(result) = results.as_slice().first() else {
+            return Err(Error::internal("call should return a result"));
+        };
+
+        Error::verify_good(&result.status_code())?;
+
+        let output_arguments = if let Some(output_arguments) = result.output_arguments() {
+            output_arguments.into_vec()
+        } else {
+            log::debug!("Calling {method_id} returned unset output arguments, assuming none exist");
+            Vec::new()
+        };
+
+        Ok(output_arguments)
+    }
+
+    /// Browses specific node.
+    ///
+    /// Use [`ua::BrowseDescription::default()`](ua::BrowseDescription) to set sensible defaults to
+    /// browse a specific node's children (forward references of the `HierarchicalReferences` type)
+    /// like this:
+    ///
+    /// ```
+    /// # use open62541::{AsyncClient, Result, ua};
+    /// use open62541_sys::UA_NS0ID_SERVER_SERVERSTATUS;
+    ///
+    /// # async fn example(client: &AsyncClient) -> Result<()> {
+    /// let node_id = ua::NodeId::ns0(UA_NS0ID_SERVER_SERVERSTATUS);
+    /// let browse_description = ua::BrowseDescription::default().with_node_id(&node_id);
+    /// let (references, continuation_point) = client.browse(&browse_description).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This fails when the node does not exist or it cannot be browsed.
+    pub async fn browse(&self, browse_description: &ua::BrowseDescription) -> BrowseResult {
+        let request =
+            ua::BrowseRequest::init().with_nodes_to_browse(slice::from_ref(browse_description));
+
+        let response = self.service_request(request).await?;
+
+        let Some(results) = response.results() else {
+            return Err(Error::internal("browse should return results"));
+        };
+
+        let Some(result) = results.as_slice().first() else {
+            return Err(Error::internal("browse should return a result"));
+        };
+
+        to_browse_result(result, Some(browse_description.node_id()))
+    }
+
+    /// Browses several nodes at once.
+    ///
+    /// This issues only a single request to the OPC UA server (and should be preferred over several
+    /// individual requests with [`browse()`] when browsing multiple nodes).
+    ///
+    /// The size and order of the result list matches the size and order of the given node ID list.
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails. When a node does not exist or cannot be
+    /// browsed, an inner `Err` is returned.
+    ///
+    /// [`browse()`]: Self::browse
+    pub async fn browse_many(
+        &self,
+        browse_descriptions: &[ua::BrowseDescription],
+    ) -> Result<Vec<BrowseResult>> {
+        let request = ua::BrowseRequest::init().with_nodes_to_browse(browse_descriptions);
+
+        let response = self.service_request(request).await?;
+
+        let Some(results) = response.results() else {
+            return Err(Error::internal("browse should return results"));
+        };
+
+        // The OPC UA specification state that the resulting list has the same number of elements as
+        // the request list. If not, we would not be able to match elements in the two lists anyway.
+        if results.len() != browse_descriptions.len() {
+            return Err(Error::internal("unexpected number of browse results"));
+        }
+
+        let results: Vec<_> = results
+            .iter()
+            .zip(browse_descriptions)
+            .map(|(result, browse_description)| {
+                to_browse_result(result, Some(browse_description.node_id()))
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Browses continuation points for more references.
+    ///
+    /// This uses continuation points returned from [`browse()`] and [`browse_many()`] whenever not
+    /// all references were returned (due to client or server limits).
+    ///
+    /// The size and order of the result list matches the size and order of the given continuation
+    /// point list.
+    ///
+    /// # Errors
+    ///
+    /// This fails only when the entire request fails. When a continuation point is invalid, an
+    /// inner `Err` is returned.
+    ///
+    /// [`browse()`]: Self::browse
+    /// [`browse_many()`]: Self::browse_many
+    pub async fn browse_next(
+        &self,
+        continuation_points: &[ua::ContinuationPoint],
+    ) -> Result<Vec<BrowseResult>> {
+        let request = ua::BrowseNextRequest::init().with_continuation_points(continuation_points);
+
+        let response = self.service_request(request).await?;
+
+        let Some(results) = response.results() else {
+            return Err(Error::internal("browse should return results"));
+        };
+
+        // The OPC UA specification state that the resulting list has the same number of elements as
+        // the request list. If not, we would not be able to match elements in the two lists anyway.
+        if results.len() != continuation_points.len() {
+            return Err(Error::Internal("unexpected number of browse results"));
+        }
+
+        let results: Vec<_> = results
+            .iter()
+            .map(|result| to_browse_result(result, None))
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Creates new [subscription](AsyncSubscription).
+    ///
+    /// # Errors
+    ///
+    /// This fails when the client is not connected.
+    pub async fn create_subscription(&self) -> Result<AsyncSubscription> {
+        let (_, subscription) = SubscriptionBuilder::default().create(self).await?;
+
+        Ok(subscription)
+    }
+
+    /// Services a generic request.
+    ///
+    /// Could be used with [`ua::ReadRequest`]/[`ua::WriteRequest`],
+    /// [`ua::BrowseRequest`]/[`ua::BrowseNextRequest`], and [`ua::CallRequest`].
+    ///
+    /// # Errors
+    ///
+    /// This fails when the client is not connected.
+    pub async fn service_request<R: ServiceRequest>(&self, request: R) -> Result<R::Response> {
+        type Cb<R> =
+            CallbackOnce<std::result::Result<<R as ServiceRequest>::Response, ua::StatusCode>>;
+
+        unsafe extern "C" fn callback_c<R: ServiceRequest>(
+            _client: *mut UA_Client,
+            userdata: *mut c_void,
+            request_id: UA_UInt32,
+            response: *mut c_void,
+        ) {
+            log::trace!(
+                "Request ID {request_id} finished, received {}",
+                R::Response::type_name(),
+            );
+
+            // SAFETY: Incoming pointer is valid for access.
+            // PANIC: We expect pointer to be valid when good.
+            let response = unsafe { response.cast::<<R::Response as DataType>::Inner>().as_ref() }
+                .expect("response should be set");
+            let response = R::Response::clone_raw(response);
+
+            let service_result = response.response_header().service_result();
+            let result = if service_result.is_good() {
+                Ok(response)
+            } else {
+                Err(service_result)
+            };
+
+            // SAFETY: `userdata` is the result of `Cb::prepare()` and is used only once.
+            unsafe {
+                Cb::<R>::execute(userdata, result);
+            }
+        }
+
+        let (tx, rx) = oneshot::channel::<Result<R::Response>>();
+
+        let callback = move |result: std::result::Result<R::Response, _>| {
+            // We always send a result back via `tx` (in fact, `rx.await` below expects this). We do not
+            // care if that succeeds though: the receiver might already have gone out of scope (when its
+            // future has been cancelled) and we must not panic in FFI callbacks.
+            let _unused = tx.send(result.map_err(Error::new));
+        };
+
+        // The background thread only terminates and finishes after being cancelled. This could only
+        // happen in disconnect() by consuming self or in drop().
+        debug_assert!(
+            self.background_thread
+                .as_ref()
+                .is_some_and(BackgroundThread::is_running_and_not_finished_yet)
+        );
+        log::debug!("Running {}", R::type_name());
+
+        let mut request_id: UA_UInt32 = 0;
+        let status_code = ua::StatusCode::new(unsafe {
+            __UA_Client_AsyncService(
+                // SAFETY: Cast to `mut` pointer, function is marked `UA_THREADSAFE`.
+                self.client.as_ptr().cast_mut(),
+                request.as_ptr().cast::<c_void>(),
+                R::data_type(),
+                Some(callback_c::<R>),
+                R::Response::data_type(),
+                Cb::<R>::prepare(callback),
+                &raw mut request_id,
+            )
+        });
+        // The request itself fails when the client is not connected (or the secure session has not been
+        // established). In all other cases, `open62541` processes the request first and then may reject
+        // it only through the response when executing our callback above.
+        Error::verify_good(&status_code).inspect_err(|_| {
+            log::warn!("{} failed: {status_code:?}", R::type_name());
+        })?;
+
+        log::trace!("Assigned ID {request_id} to {}", R::type_name());
+
+        // PANIC: When `callback` is called (which owns `tx`), we always call `tx.send()`. So the sender
+        // is only dropped after placing a value into the channel and `rx.await` always finds this value
+        // there.
+        rx.await
+            .unwrap_or(Err(Error::internal("callback should send result")))
+    }
+
+    pub(crate) const fn client(&self) -> &Arc<ua::Client> {
+        &self.client
+    }
+}
+
+impl Drop for AsyncClient {
+    fn drop(&mut self) {
+        // If `disconnect()` has been called before (either run to completion or cancelled), all has
+        // been done to shut down the background thread. The only thing that may be left is properly
+        // joining the background thread. We don't do that here to avoid the amount of blocking that
+        // this could involve. By dropping the handle, the OS is able to release all resources soon,
+        // i.e., when the thread has actually run to completion (if it hasn't done so already).
+        let Some(background_thread) = self.background_thread.take() else {
+            log::debug!("Background task has already finished before dropping client");
+            return;
+        };
+
+        // The background thread has not been cancelled yet, because it is only cancelled here
+        // or in disconnect(). It doesn't terminate and finish on its own before being cancelled.
+        debug_assert!(background_thread.is_running_and_not_finished_yet());
+
+        log::info!("Cancelling and joining background task when dropping client");
+        background_thread.cancel(BackgroundTaskCancellationMode::TerminateAsap);
+        background_thread.join_after_cancelled_on_drop_blocking();
+
+        log::info!("Background task finished when dropping client");
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundThread {
+    state: Arc<AtomicU8>,
+    handle: JoinHandle<()>,
+    terminated_rx: oneshot::Receiver<()>,
+}
+
+impl BackgroundThread {
+    fn spawn(client: Arc<ua::Client>) -> Self {
+        let state = Arc::new(AtomicU8::new(BackgroundTaskState::Running.to_u8()));
+        let (terminated_tx, terminated_rx) = oneshot::channel();
+
+        // Run the event loop concurrently. We do so on a thread where we may block: we need to call
+        // `UA_Client_run_iterate()` and this method blocks for up to `RUN_ITERATE_TIMEOUT`.
+        //
+        // We use an OS thread here instead of tokio's blocking tasks because we may need to join on
+        // the task blockingly in `drop()` and this requires proper concurrency (otherwise, we would
+        // risk deadlocking on single-threaded tokio runners).
+        let handle = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                let () = background_task(&client, &state);
+                log::info!("Background task terminated");
+                // The send() is redundant here, because dropping the sender will also wake up and unblock the receiver.
+                // terminated_tx will be dropped implicitly even if background_task() panics.
+                let _unused = terminated_tx.send(());
+            })
+        };
+
+        Self {
+            state,
+            handle,
+            terminated_rx,
+        }
+    }
+
+    #[must_use]
+    fn is_running_and_not_finished_yet(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == BackgroundTaskState::Running.to_u8()
+            && !self.handle.is_finished()
+    }
+
+    fn cancel(&self, mode: BackgroundTaskCancellationMode) {
+        self.state.store(
+            BackgroundTaskState::Cancelled { mode }.to_u8(),
+            Ordering::Relaxed,
+        );
+    }
+
+    async fn join_after_cancelled(self) {
+        let Self {
+            state,
+            handle,
+            terminated_rx,
+        } = self;
+        debug_assert_ne!(
+            state.load(Ordering::Relaxed),
+            BackgroundTaskState::Running.to_u8()
+        );
+
+        if handle.is_finished() {
+            // Nothing to do.
+            return;
+        }
+
+        // TODO: Use `tracing` and span to group log messages.
+        log::info!("Waiting for background task to finish after cancelling");
+
+        // We need to wait for the task to finish and must do so blockingly.
+        // `UA_Client_delete()` is not safe to run concurrently while `UA_Client_run_iterate()`
+        // is still running. We ignore the result, because we do not care if the thread panicked
+        // (and there is nothing that we could do anyway in that case).
+        let join_background_thread_blocking = move || {
+            let _unused = handle.join();
+        };
+
+        // Asynchronously wait for the background task to terminate.
+        //
+        // We ignore the result: the sender is only dropped when the background thread has finished,
+        // which is exactly what we are waiting for anyway in the next step.
+        let _unused = terminated_rx.await;
+
+        // After the background task has terminated the background thread should finish almost instantly.
+        #[cfg(feature = "tokio")]
+        {
+            // The enclosing `async fn` is probably running on a Tokio runtime thread,
+            // but we cannot be sure.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                // Spawning a worker thread for joining the background thread synchronously
+                // works independent of the runtime flavor (single/multi-threaded).
+                let _unused = rt.spawn_blocking(join_background_thread_blocking).await;
+                return;
+            }
+        }
+
+        log::warn!("Blocking async runtime thread to join background thread");
+        join_background_thread_blocking();
+    }
+
+    fn join_after_cancelled_on_drop_blocking(self) {
+        let Self {
+            state,
+            handle,
+            // The one-shot channel receiver is useless here.
+            terminated_rx: _,
+        } = self;
+        debug_assert_ne!(
+            state.load(Ordering::Relaxed),
+            BackgroundTaskState::Running.to_u8()
+        );
+
+        if handle.is_finished() {
+            // Nothing to do.
+            return;
+        }
+
+        // TODO: Use `tracing` and span to group log messages.
+        log::info!("Waiting for background task to finish after cancelling (blocking)");
+
+        // We need to wait for the task to finish and must do so blockingly.
+        // `UA_Client_delete()` is not safe to run concurrently while `UA_Client_run_iterate()`
+        // is still running. We ignore the result, because we do not care if the thread panicked
+        // (and there is nothing that we could do anyway in that case).
+        let join_background_thread_blocking = move || {
+            let _unused = handle.join();
+        };
+
+        // `AsyncClient` is supposed to be used in asynchronous context. Note that blocking runtime
+        // threads may cause deadlocks and must be avoided.
+        #[cfg(feature = "tokio")]
+        if let Ok(rt) = &tokio::runtime::Handle::try_current() {
+            // Asynchronous context.
+            if matches!(
+                rt.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread
+            ) {
+                // Using tokio::task::block_in_place() here would panic.
+                log::warn!("Blocking async runtime thread to join background thread");
+                // Continue below.
+            } else {
+                tokio::task::block_in_place(join_background_thread_blocking);
+                return;
+            }
+        }
+
+        join_background_thread_blocking();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackgroundTaskState {
+    Running,
+    Cancelled {
+        mode: BackgroundTaskCancellationMode,
+    },
+}
+
+impl BackgroundTaskState {
+    // Map all possible states to u8 that could be stored in an AtomicU8.
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Running => 0,
+            Self::Cancelled { mode } => match mode {
+                BackgroundTaskCancellationMode::TerminateAfterNotConnected => 1,
+                BackgroundTaskCancellationMode::TerminateAsap => 2,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackgroundTaskCancellationMode {
+    /// Terminate gracefully by servicing all pending requests until no longer connected.
+    TerminateAfterNotConnected,
+    /// Terminate as soon as possible.
+    TerminateAsap,
+}
+
+/// Background task for [`ua::Client`].
+///
+/// This runs [`UA_Client_run_iterate()`] in a loop, blocking for up to `RUN_ITERATE_TIMEOUT` during
+/// each iteration. Termination is controlled through the shared atomic `state`, which is checked
+/// between loop iterations. Setting the state to
+/// [`BackgroundTaskState::Cancelled { mode: BackgroundTaskCancellationMode::TerminateAsap }`]
+/// stops the task before the next iteration, while
+/// [`BackgroundTaskState::Cancelled { mode: BackgroundTaskCancellationMode::TerminateAfterNotConnected }`]
+/// requests graceful shutdown by continuing to service pending work until the client is no longer
+/// connected.
+fn background_task(client: &ua::Client, state: &AtomicU8) {
+    log::info!("Starting background task");
+
+    // `UA_Client_run_iterate()` expects the timeout to be given in milliseconds.
+    let timeout_millis = u32::try_from(RUN_ITERATE_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
+
+    // Run until cancelled.
+    let mut last_connect_status = ua::StatusCode::GOOD;
+    loop {
+        let current_state = state.load(Ordering::Relaxed);
+        if current_state
+            == (BackgroundTaskState::Cancelled {
+                mode: BackgroundTaskCancellationMode::TerminateAsap,
+            })
+            .to_u8()
+        {
+            log::info!("Terminating cancelled background task");
+            break;
+        }
+        debug_assert!(
+            current_state == BackgroundTaskState::Running.to_u8()
+                || current_state
+                    == BackgroundTaskState::Cancelled {
+                        mode: BackgroundTaskCancellationMode::TerminateAfterNotConnected
+                    }
+                    .to_u8()
+        );
+
+        // Track time of iteration start to report iteration times below.
+        let start_of_iteration = Instant::now();
+
+        let connect_status = ua::StatusCode::new({
+            log::trace!("Running iterate");
+
+            // This returns after the timeout even when nothing was processed. The internal mutex is
+            // _not_ held for the entire time though, so we can send out requests concurrently while
+            // the client is running the iteration.
+            //
+            // The invocation returns the current connect status of the client.
+            unsafe {
+                UA_Client_run_iterate(
+                    // SAFETY: Cast to `mut` pointer, function is marked `UA_THREADSAFE`.
+                    client.as_ptr().cast_mut(),
+                    timeout_millis,
+                )
+            }
+        });
+        let time_taken = start_of_iteration.elapsed();
+        log::trace!("Iterate run took {time_taken:?}");
+
+        if let Err(error) = Error::verify_good(&connect_status) {
+            let not_connected = matches!(
+                connect_status.clone().into_raw(),
+                UA_STATUSCODE_BADDISCONNECT
+                    | UA_STATUSCODE_BADCONNECTIONCLOSED
+                    | UA_STATUSCODE_BADCONNECTIONREJECTED
+            );
+            if current_state
+                == (BackgroundTaskState::Cancelled {
+                    mode: BackgroundTaskCancellationMode::TerminateAfterNotConnected,
+                })
+                .to_u8()
+            {
+                if not_connected {
+                    log::info!(
+                        "Terminating cancelled background task after not connected: {error}"
+                    );
+                } else {
+                    log::error!(
+                        "Terminating cancelled background task on unexpected error: {error}"
+                    );
+                }
+                return;
+            }
+            // Only log each bad connect status once after its first occurrence.
+            if connect_status != last_connect_status {
+                if not_connected {
+                    log::info!("Bad connect status in background task: {error}");
+                } else {
+                    // TODO: Handle more status codes?
+                    log::error!("Unexpected error in background task: {error}");
+                }
+            }
+            // Continue until cancelled.
+        }
+        last_connect_status = connect_status;
+    }
+}
+
+/// Converts [`ua::BrowseResult`] to our public result type.
+fn to_browse_result(result: &ua::BrowseResult, node_id: Option<&ua::NodeId>) -> BrowseResult {
+    // Make sure to verify the inner status code inside `BrowseResult`. The service request finishes
+    // without error, even when browsing the node has failed.
+    Error::verify_good(&result.status_code())?;
+
+    let references = if let Some(references) = result.references() {
+        references.into_vec()
+    } else {
+        // When no references exist, some OPC UA servers do not return an empty references array but
+        // an invalid (unset) one instead, e.g. Siemens SIMOTION. We treat it as an empty array, and
+        // continue without error.
+        if let Some(node_id) = node_id {
+            log::debug!("Browsing {node_id} returned unset references, assuming none exist");
+        } else {
+            log::debug!(
+                "Browsing continuation point returned unset references, assuming none exist",
+            );
+        }
+        Vec::new()
+    };
+
+    Ok((references, result.continuation_point()))
+}

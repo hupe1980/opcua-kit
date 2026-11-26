@@ -1,0 +1,11 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,7 +22,7 @@
+ log = "0.4.20"
+ open62541-sys = { version = "0.6.5" }
+ parking_lot = "0.12.4"
+-paste = "1.0.14"
++paste = { package = "pastey", version = "0.2.3" }
+ serde = { version = "1.0.194", optional = true }
+ serde_json = { version = "1.0.111", optional = true }
+ thiserror = "2.0.3"

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if page %}{% set title = page.title ~ " | opcua-kit" %}{% set description = page.description %}{% set url = page.permalink %}
+  {% elif section %}{% set title = section.title ~ " | opcua-kit" %}{% set description = section.description %}{% set url = section.permalink %}
+  {% else %}{% set title = "Page not found | opcua-kit" %}{% set description = "Return to the OPC UA library documentation." %}{% endif %}
+  <title>{{ title }}</title>
+  <meta name="description" content="{{ description }}">
+  {% if url %}
+  <link rel="canonical" href="{{ url }}">
+  <meta property="og:url" content="{{ url }}">
+  <meta property="og:type" content="{% if page and page.extra.group %}article{% else %}website{% endif %}">
+  <meta property="og:site_name" content="opcua-kit">
+  <meta property="og:title" content="{{ title }}">
+  <meta property="og:description" content="{{ description }}">
+  <meta property="og:image" content="{{ get_url(path='social.jpg') }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="opcua-kit industrial robot illustration">
+  <meta name="twitter:card" content="summary_large_image">
+  {% else %}<meta name="robots" content="noindex">{% endif %}
+  <link rel="icon" href="{{ get_url(path='icon.png') }}">
+  <link rel="stylesheet" href="{{ get_url(path='guide.css') }}">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="mast"><div class="wrap bar">
+  <a class="brand" href="{{ get_url(path='@/_index.md') }}"><i class="sigil" aria-hidden="true"></i>opcua-kit</a>
+  <nav aria-label="Main navigation"><a href="{{ get_url(path='@/documentation.md') }}"{% if page and page.slug == "documentation" %} aria-current="page"{% endif %}>Documentation</a><a href="{{ get_url(path='@/services.md') }}"{% if page and page.slug == "services" %} aria-current="page"{% endif %}>Protocol roles</a></nav>
+</div></header>
+<main id="main">{% block body %}{% endblock %}</main>
+<footer><div class="wrap foot"><a class="brand" href="{{ get_url(path='@/_index.md') }}"><i class="sigil" aria-hidden="true"></i>opcua-kit</a><nav aria-label="Footer"><a href="{{ get_url(path='@/documentation.md') }}">Documentation</a><a href="{{ get_url(path='@/client.md') }}">Client guide</a></nav></div></footer>
+</body>
+</html>

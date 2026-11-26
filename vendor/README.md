@@ -1,0 +1,5 @@
+# Rust wrapper provenance
+
+`open62541/` contains the library sources, MPL-2.0 license, readme, changelog and normalized Cargo manifest from open62541 0.12.1. The published archive has SHA-256 `981cb8f3d1861debcdad0e95b0ce212a5e5e8104adb6b5c49ceea95fe76d6dd7` and identifies upstream commit `99091a4b80dd6c5bfec5d969286cc6a20d8cb091`. The sole modification is the manifest dependency that uses pastey under the existing paste alias. The native C library and cryptography dependencies still come from the locked registry packages. [Upstream release](https://crates.io/crates/open62541/0.12.1) · [Maintenance advisory](https://rustsec.org/advisories/RUSTSEC-2024-0436.html)
+
+Run `python3 contrib/verify-backend.py` from the repository root to compare every included file against the authenticated archive checksum. Pass a local `.crate` file for offline verification. The equivalent change to the original Git manifest is in [the upstream patch](../contrib/open62541-pastey.patch). Retire this copy when a published wrapper with the replacement is qualified against the peer suite.

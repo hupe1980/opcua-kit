@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "device": "example-grid-incomer",
+  "applicationUri": "urn:example:grid-meter",
+  "principal": "anonymous",
+  "signals": [
+    {
+      "name": "GridImportWh",
+      "node": {
+        "namespace": "urn:example:meter",
+        "id": "s=GridImportWh"
+      },
+      "dataType": {
+        "namespace": "http://opcfoundation.org/UA/",
+        "id": "i=10"
+      },
+      "valueRank": -1,
+      "engineeringUnits": {
+        "namespaceUri": "http://www.opcfoundation.org/UA/units/un/cefact",
+        "unitId": 5720146
+      }
+    }
+  ]
+}

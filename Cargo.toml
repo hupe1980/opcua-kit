@@ -1,0 +1,96 @@
+[package]
+name = "opcua-kit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Embeddable OPC UA client, server and UADP library for Rust applications"
+license = "MIT OR Apache-2.0"
+homepage = "https://hupe1980.github.io/opcua-kit/"
+repository = "https://github.com/hupe1980/opcua-kit"
+readme = "README.md"
+keywords = ["opcua", "opc-ua", "automation"]
+categories = ["command-line-utilities", "network-programming"]
+include = [
+    "/src/**/*.rs",
+    "/src/bin/opcua-kit/capture.py",
+    "/examples/*.rs",
+    "/contrib/open62541-pastey.patch",
+    "/vendor/README.md",
+    "/fixtures/commissioning/*.json",
+    "/fixtures/units/*.json",
+    "/fixtures/meter/*.json",
+    "/fixtures/meter/*.ndjson",
+    "/tests/**/*.rs",
+    "/tests/**/*.py",
+    "/tests/**/*.cjs",
+    "/tests/**/*.sh",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/site/README.md",
+    "/site/content/authoring.md",
+    "/site/content/client.md",
+    "/site/content/services.md",
+    "/site/content/navigation.md",
+    "/site/content/recovery.md",
+    "/site/content/meter.md",
+    "/site/content/automation.md",
+    "/site/content/capture.md",
+    "/LICENSE-*",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = ["client"]
+server = ["dep:open62541", "dep:open62541-sys", "dep:thiserror", "dep:x509-parser"]
+pubsub = []
+control = ["client"]
+commissioning = ["dep:serde", "dep:serde_json", "dep:uuid", "dep:base64"]
+cems = ["commissioning", "dep:time"]
+client = ["dep:time", "dep:uuid", "dep:base64", "dep:open62541", "dep:open62541-sys", "tokio/time", "dep:x509-parser", "dep:tokio", "dep:thiserror"]
+cli = ["client", "commissioning", "tokio/time", "dep:clap", "dep:tempfile", "dep:rustix", "dep:signal-hook"]
+
+[[bin]]
+name = "opcua-kit"
+path = "src/bin/opcua-kit/main.rs"
+required-features = ["cli"]
+
+[[example]]
+name = "read"
+required-features = ["client"]
+
+[[example]]
+name = "local_server"
+required-features = ["server"]
+
+[[example]]
+name = "uadp"
+required-features = ["pubsub"]
+
+[[example]]
+name = "project_meter"
+required-features = ["cems"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+thiserror = { version = "2", optional = true }
+open62541-sys = { version = "=0.6.6", optional = true }
+open62541 = { path = "vendor/open62541", version = "=0.12.1", default-features = false, features = ["mbedtls", "tokio", "time"], optional = true }
+x509-parser = { version = "0.18.1", default-features = false, optional = true }
+
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+time = { version = "0.3.55", default-features = false, features = ["parsing", "formatting"], optional = true }
+uuid = { version = "1", default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+tempfile = { version = "3", optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", features = ["process", "fs"], optional = true }
+signal-hook = { version = "0.3", default-features = false, optional = true }

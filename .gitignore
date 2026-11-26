@@ -1,0 +1,10 @@
+/target/
+
+# Local research and Spec Kit workspace (shared convention with bacnet-kit).
+/concepts/
+/specs/
+/.specify/
+/.agents/skills/speckit-*/
+
+/site/public/
+__pycache__/

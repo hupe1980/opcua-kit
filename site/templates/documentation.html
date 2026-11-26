@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block body %}
+{% set root = get_section(path="_index.md") %}
+<div class="wrap library">
+  <header class="doc-intro"><h1>{{ page.title }}</h1>{{ page.content | safe }}</header>
+  <div class="finder" hidden><label for="guide-query">Find a guide</label><input id="guide-query" type="search" placeholder="Search by task, service or feature"></div>
+  {% for group in config.extra.guide_groups %}
+  <section class="guide-section"><h2>{{ group }}</h2><div class="guide-grid">
+    {% for guide in root.pages %}{% if guide.extra.group and guide.extra.group == group %}
+    <a class="guide-card" href="{{ guide.permalink }}" data-topics="{{ guide.extra.keywords }} {% for h in guide.toc %}{{ h.title }} {% for sub in h.children %}{{ sub.title }} {% endfor %}{% endfor %}"><h3>{{ guide.title }}</h3><p>{{ guide.description }}</p></a>
+    {% endif %}{% endfor %}
+  </div></section>{% endfor %}
+  <p id="results" role="status"></p>
+</div>
+<script defer src="{{ get_url(path='finder.js') }}"></script>
+{% endblock %}

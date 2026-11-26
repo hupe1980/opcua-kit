@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "device": "ahu-01",
+  "applicationUri": "urn:opcua-kit:fixture",
+  "principal": "anonymous",
+  "signals": [
+    {
+      "name": "FanEnabled",
+      "node": {
+        "namespace": "urn:fixture:hvac",
+        "id": "s=FanEnabled"
+      },
+      "dataType": {
+        "status": 0,
+        "value": {
+          "namespace": "http://opcfoundation.org/UA/",
+          "id": "i=1"
+        }
+      }
+    },
+    {
+      "name": "Pressure",
+      "node": {
+        "namespace": "urn:fixture:hvac",
+        "id": "s=Pressure"
+      },
+      "dataType": {
+        "status": 2150891520
+      }
+    },
+    {
+      "name": "SupplyTemp",
+      "node": {
+        "namespace": "urn:fixture:hvac",
+        "id": "s=SupplyTemp"
+      },
+      "dataType": {
+        "status": 0,
+        "value": {
+          "namespace": "http://opcfoundation.org/UA/",
+          "id": "i=12"
+        }
+      }
+    }
+  ]
+}
