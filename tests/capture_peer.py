@@ -1202,6 +1202,19 @@ class CapturePeer(unittest.TestCase):
                     [p["wh"] for p in json.loads(trace.stdout)["register"]],
                     projected_wh,
                 )
+                summary, *details = trace.stderr.splitlines()
+                if second_endpoint == self.reordered:
+                    self.assertEqual(details, [])
+                else:
+                    reason = (
+                        "OPC UA status 0x40900000"
+                        if second_endpoint == self.uncertain
+                        else "register cannot resolve 1 Wh increments"
+                    )
+                    self.assertEqual(
+                        details,
+                        [f"First exclusion at readings line 2 (source 2020-10-25T01:00:00Z): {reason}."],
+                    )
                 artifact = trace.stdout
                 if path == "library":
                     # Push two authenticated readings directly in Rust; only the
@@ -1227,7 +1240,7 @@ class CapturePeer(unittest.TestCase):
                     self.assertEqual(document["trace"], json.loads(trace.stdout))
                     self.assertEqual(
                         [len(projected_wh), *document["counters"]],
-                        [int(n) for n in re.findall(r"\d+", trace.stderr)],
+                        [int(n) for n in re.findall(r"\d+", summary)],
                     )
                     artifact = json.dumps(document["trace"])
                 if cemsd := os.environ.get("OPCUA_KIT_CEMSD_BIN"):
