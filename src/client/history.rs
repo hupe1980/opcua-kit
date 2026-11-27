@@ -1,10 +1,10 @@
 //! Bounded forward raw history for one configured measurement.
-mod wire;
+
+use super::ua;
 use super::{Client, FixedScalar, ReadError, ReadSession, Sample};
 use crate::NodeId;
-use open62541::{DataType, ua};
 use time::OffsetDateTime;
-use wire::{Details, HistoryData, Response};
+use ua::{HistoryReadResponse as Response, ReadRawModifiedDetails as Details};
 
 /// Historical values returned in server order, with the raw per-page operation statuses.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,31 +37,21 @@ pub enum HistoryError {
     /// More pages or values would be needed than the configured bound.
     #[error("history exceeds sample or page limit")]
     Limit,
-    /// The SDK could not allocate the service operand.
-    #[error("could not allocate history request")]
-    Allocation,
 }
 
-fn tick(time: OffsetDateTime) -> Result<i64, HistoryError> {
-    super::sample::exact_datetime(time)
-        .map(DataType::into_raw)
-        .ok_or(HistoryError::Window)
+fn tick(time: OffsetDateTime) -> Result<ua::DateTime, HistoryError> {
+    super::sample::exact_datetime(time).ok_or(HistoryError::Window)
 }
 
-fn result(response: &Response) -> Result<&open62541_sys::UA_HistoryReadResult, HistoryError> {
-    // SAFETY: borrow one SDK-decoded per-node result for the lifetime of its response.
-    let [r] = unsafe { super::wire::slice(response.0.results, response.0.resultsSize, 1) }
-        .ok_or(HistoryError::InvalidResponse)?
-    else {
-        return Err(HistoryError::InvalidResponse);
-    };
-    Ok(r)
+fn result(response: &Response) -> Result<&ua::HistoryReadResult, HistoryError> {
+    match response.results.as_deref() {
+        Some([result]) => Ok(result),
+        _ => Err(HistoryError::InvalidResponse),
+    }
 }
 
-fn cursor(r: &open62541_sys::UA_HistoryReadResult) -> Result<&[u8], HistoryError> {
-    let bytes = ua::ByteString::raw_ref(&r.continuationPoint)
-        .as_bytes()
-        .unwrap_or_default();
+fn cursor(r: &ua::HistoryReadResult) -> Result<&[u8], HistoryError> {
+    let bytes = r.continuation_point.as_ref();
     if bytes.len() > 65536 {
         Err(HistoryError::InvalidResponse)
     } else {
@@ -78,14 +68,18 @@ impl Client {
         point: &[u8],
         release: bool,
     ) -> Result<Response, HistoryError> {
-        let req = wire::request(node, details, point, release).inspect_err(|_| {
-            if !point.is_empty() {
-                session.interrupted = true;
-            }
-        })?;
-        Ok(self
-            .guarded(session, self.inner.service_request(req))
-            .await?)
+        let req = ua::HistoryReadRequest {
+            history_read_details: ua::ExtensionObject::new(details.clone()),
+            timestamps_to_return: ua::TimestampsToReturn::Both,
+            release_continuation_points: release,
+            nodes_to_read: Some(vec![ua::HistoryReadValueId {
+                node_id: node.clone(),
+                continuation_point: point.into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        Ok(self.guarded(session, self.inner.request(req)).await?)
     }
 
     /// Read raw historical Boolean or numeric values with both timestamps, without interpolation.
@@ -98,13 +92,15 @@ impl Client {
         end: OffsetDateTime,
         limit: usize,
     ) -> Result<HistoricalRead<T>, HistoryError> {
-        let mut details = Details::init();
-        details.0.startTime = tick(start)?;
-        details.0.endTime = tick(end)?;
         if start >= end || !(1..=4096).contains(&limit) {
             return Err(HistoryError::Window);
         }
-        details.0.numValuesPerNode = (limit + 1).min(256) as u32;
+        let details = Details {
+            start_time: tick(start)?,
+            end_time: tick(end)?,
+            num_values_per_node: (limit + 1).min(256) as u32,
+            ..Default::default()
+        };
         let (mut session, metadata) = self.read_session().await?;
         let node = metadata.namespaces.wire_node(node, 0)?;
         let mut out = HistoricalRead {
@@ -133,10 +129,10 @@ impl Client {
                 &mut out,
                 r,
                 limit,
-                details.0.numValuesPerNode as usize,
+                details.num_values_per_node as usize,
                 &mut timestamps,
             );
-            if let Err(err) = appended.and_then(|()| {
+            if let Err(err) = appended.and({
                 if !point.is_empty()
                     && (out.samples.len() == limit || out.page_statuses.len() == 64)
                 {
@@ -150,9 +146,9 @@ impl Client {
                         .history_request(&mut session, &node, &details, &point, true)
                         .await?;
                     // An unconfirmed release retires the session so its teardown frees the cursor.
-                    if !result(&released)
-                        .is_ok_and(|r| r.statusCode == 0 && cursor(r).is_ok_and(|p| p.is_empty()))
-                    {
+                    if !result(&released).is_ok_and(|r| {
+                        r.status_code.bits() == 0 && cursor(r).is_ok_and(|p| p.is_empty())
+                    }) {
                         session.interrupted = true;
                         return Err(HistoryError::InvalidResponse);
                     }
@@ -184,26 +180,27 @@ impl SourceWindow {
 }
 fn append<T: FixedScalar>(
     out: &mut HistoricalRead<T>,
-    r: &open62541_sys::UA_HistoryReadResult,
+    r: &ua::HistoryReadResult,
     limit: usize,
     page_size: usize,
     timestamps: &mut SourceWindow,
 ) -> Result<(), HistoryError> {
-    if r.statusCode >> 30 != 0 {
-        return Err(HistoryError::Status(r.statusCode));
+    if r.status_code.bits() >> 30 != 0 {
+        return Err(HistoryError::Status(r.status_code.bits()));
     }
-    let data = ua::ExtensionObject::raw_ref(&r.historyData)
-        .decoded_content::<HistoryData>()
+    let data = r
+        .history_data
+        .inner_as::<ua::HistoryData>()
         .ok_or(HistoryError::InvalidResponse)?;
-    if data.0.dataValuesSize > limit - out.samples.len() {
+    let values = data.data_values.as_deref().unwrap_or_default();
+    if values.len() > limit - out.samples.len() {
         return Err(HistoryError::Limit);
     }
-    // SAFETY: data borrows the SDK response, which remains alive until all elements are decoded.
-    let values = unsafe { super::wire::slice(data.0.dataValues, data.0.dataValuesSize, page_size) }
-        .ok_or(HistoryError::InvalidResponse)?;
-    for v in values {
-        let raw = ua::DataValue::raw_ref(v);
-        if raw.source_timestamp().is_none() && raw.server_timestamp().is_none() {
+    if values.len() > page_size {
+        return Err(HistoryError::InvalidResponse);
+    }
+    for raw in values {
+        if raw.source_timestamp.is_none() && raw.server_timestamp.is_none() {
             return Err(HistoryError::InvalidResponse);
         }
         let sample = super::sample::decode_borrowed(raw, T::decode)?;
@@ -212,7 +209,7 @@ fn append<T: FixedScalar>(
         }
         out.samples.push(sample);
     }
-    out.page_statuses.push(r.statusCode);
+    out.page_statuses.push(r.status_code.bits());
     Ok(())
 }
 

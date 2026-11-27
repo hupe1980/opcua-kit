@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.1.0 — 2026-11-26
+## 0.1.0 — 2026-11-27
 
-- Added an OPC TCP client with certificate-pinned sessions, browsing, typed reads, subscriptions, alarm events and raw history.
-- Added opt-in writes, method calls and condition acknowledgement. Applications can also host read-only variables or exchange UADP key frames.
-- Added signal-contract checks and field commands for commissioning. The optional CEMS integration reconciles import-meter readings with independently closed intervals.
+- Added dependency-free endpoint discovery and unsigned UADP scalar key frames.
+- Added a Rust client for certificate-pinned sessions, typed reads, browsing, subscriptions, events, and raw history. The optional control API supports writes, method calls, and alarm acknowledgement.
+- Added a Rust server for application-owned, read-only variables and data-change subscriptions.
+- Added a commissioning CLI for offline credential checks, live metadata capture, and signal-contract assessment. The optional CEMS profile prepares meter traces for interval reconciliation.
 
 ## 0.0.1 — 2026-11-24
 

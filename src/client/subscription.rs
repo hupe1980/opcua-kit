@@ -1,16 +1,13 @@
 use std::{
-    num::NonZeroU32,
+    collections::BTreeMap,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
-use open62541::{
-    AsyncSubscription, DataType, MonitoredItemCreateRequestBuilder, MonitoredItemHandle,
-    SubscriptionBuilder,
-};
+use super::events::wire;
 use tokio::sync::{SemaphorePermit, mpsc};
 
 use super::{Client, DataValue, ReadError, ua};
@@ -44,9 +41,9 @@ pub enum SubscriptionError {
     ItemRejected {
         /// Zero-based position in the supplied list.
         index: usize,
-        /// Original SDK error for the item.
+        /// Original OPC UA status for the item.
         #[source]
-        source: open62541::Error,
+        source: ua::StatusCode,
     },
     /// Eight active subscriptions already exist on this client.
     #[error("client already has eight active subscriptions")]
@@ -60,7 +57,7 @@ pub enum SubscriptionError {
         /// Zero-based position in the supplied list.
         index: usize,
     },
-    /// The bounded callback-to-consumer queue filled. Create a fresh subscription.
+    /// The bounded notification queue filled. Create a fresh subscription.
     #[error("local notification buffer overflowed; resynchronize the value")]
     LocalOverflow,
     /// A notification's Variant exceeded 128 KiB of UA binary data or could not be measured.
@@ -87,6 +84,14 @@ pub enum SubscriptionError {
         /// Full OPC UA StatusCode.
         status: u32,
     },
+    /// A Publish response skipped or repeated a sequence number.
+    #[error("data-change sequence gap: expected {expected}, got {actual}")]
+    SequenceGap {
+        /// Next sequence expected on this subscription.
+        expected: u32,
+        /// Sequence returned by the server.
+        actual: u32,
+    },
     /// No notification arrived within this caller-selected wait. The handle remains usable.
     #[error("timed out waiting for a data change")]
     Timeout,
@@ -98,6 +103,7 @@ pub enum SubscriptionError {
 #[derive(Default)]
 struct Loss {
     local: AtomicBool,
+    gap: OnceLock<(u32, u32)>,
     server: OnceLock<(usize, u32)>,
     closed: AtomicBool,
     value_limit: OnceLock<usize>,
@@ -105,6 +111,9 @@ struct Loss {
 
 impl Loss {
     fn check(&self) -> Result<(), SubscriptionError> {
+        if let Some(&(expected, actual)) = self.gap.get() {
+            return Err(SubscriptionError::SequenceGap { expected, actual });
+        }
         if let Some(&(index, status)) = self.server.get() {
             return Err(SubscriptionError::ItemOverflow { index, status });
         }
@@ -120,27 +129,25 @@ impl Loss {
         Ok(())
     }
 
-    fn deliver(
-        &self,
-        tx: &mpsc::Sender<Option<DataChange>>,
-        index: usize,
-        value: DataValue<ua::Variant>,
-    ) {
+    fn deliver(&self, tx: &mpsc::Sender<Option<DataChange>>, index: usize, value: &DataValue) {
         if self.check().is_err() {
             return;
         }
-        let status = value.status().map_or(0, DataType::into_raw);
+        let status = value.status.unwrap_or_default().bits();
         // StatusCode InfoType=DataValue (bits 10–11) and Overflow (bit 7).
         let message = if status & 0x0000_0c80 == 0x0000_0480 {
             let _ = self.server.set((index, status));
             None
-        } else if value.value().is_some_and(|variant| {
+        } else if value.value.as_ref().is_some_and(|variant| {
             super::wire::variant_size(variant).is_none_or(|bytes| bytes > MAX_VALUE_BYTES)
         }) {
             let _ = self.value_limit.set(index);
             None
         } else {
-            Some(DataChange { index, value })
+            Some(DataChange {
+                index,
+                value: value.clone(),
+            })
         };
         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(message) {
             self.local.store(true, Ordering::Release);
@@ -154,7 +161,7 @@ pub struct DataChange {
     /// Index into [`MonitoredDataChanges::items`] in the original request order.
     pub index: usize,
     /// Original status, clocks and Variant emitted by the peer.
-    pub value: DataValue<ua::Variant>,
+    pub value: DataValue,
 }
 
 /// Stable identity and revised monitoring parameters for one group member.
@@ -170,7 +177,7 @@ pub struct MonitoredNode {
 
 /// One OPC UA subscription monitoring multiple Value attributes on the original session.
 /// Drop requests deletion of all items and the subscription. A loss on any item ends the group.
-/// The callback does not expose Publish sequence numbers or Republish.
+/// Use a dedicated sequenced stream when you need retransmission or per-message provenance.
 pub struct MonitoredDataChanges<'a> {
     client: &'a Client,
     receiver: mpsc::Receiver<Option<DataChange>>,
@@ -179,32 +186,203 @@ pub struct MonitoredDataChanges<'a> {
     ended: bool,
     items: Vec<MonitoredNode>,
     publishing: Duration,
-    // Items must be dropped before their owning subscription.
-    _handles: Vec<MonitoredItemHandle>,
-    _subscription: AsyncSubscription,
+    _registration: Registration,
     _permit: SemaphorePermit<'a>,
 }
 
 /// Single-node convenience handle returned by [`Client::subscribe`].
 pub struct DataChanges<'a>(MonitoredDataChanges<'a>);
 
-struct Callback {
-    sender: mpsc::Sender<Option<DataChange>>,
-    loss: Arc<Loss>,
-    index: usize,
+/// Publish responses can carry notifications for any subscription on the session.
+#[derive(Clone, Default)]
+pub(super) struct PublishGroups(Arc<Mutex<GroupState>>);
+
+#[derive(Default)]
+struct GroupState {
+    routes: BTreeMap<u32, Route>,
+    running: bool,
+    changes: u64,
 }
 
-impl Callback {
-    fn deliver(&self, value: DataValue<ua::Variant>) {
-        self.loss.deliver(&self.sender, self.index, value);
+struct Route {
+    sender: mpsc::Sender<Option<DataChange>>,
+    loss: Arc<Loss>,
+    count: usize,
+    expected: u32,
+    timeout_ms: u32,
+}
+
+impl Route {
+    fn end(&self) {
+        self.loss.closed.store(true, Ordering::Release);
+        let _ = self.sender.try_send(None);
+    }
+
+    fn receive(&mut self, message: &ua::NotificationMessage) {
+        let notes = message.notification_data.as_deref().unwrap_or_default();
+        if self.expected != message.sequence_number {
+            let _ = self.loss.gap.set((self.expected, message.sequence_number));
+            self.end();
+            return;
+        }
+        if notes.is_empty() {
+            return;
+        }
+        self.expected = self.expected.wrapping_add(1).max(1);
+        let mut changes = Vec::new();
+        if notes.len() > CAPACITY {
+            self.end();
+            return;
+        }
+        for note in notes {
+            let Some(data) = note.inner_as::<ua::DataChangeNotification>() else {
+                self.end();
+                return;
+            };
+            let items = data.monitored_items.as_deref().unwrap_or_default();
+            if items.is_empty() || items.len() > CAPACITY - changes.len() {
+                self.end();
+                return;
+            }
+            for item in items {
+                let Some(index) = item
+                    .client_handle
+                    .checked_sub(1)
+                    .map(|n| n as usize)
+                    .filter(|&n| n < self.count)
+                else {
+                    self.end();
+                    return;
+                };
+                changes.push((index, &item.value));
+            }
+        }
+        for (index, data) in changes {
+            self.loss.deliver(&self.sender, index, data);
+        }
     }
 }
 
-impl Drop for Callback {
+struct Registration {
+    groups: PublishGroups,
+    id: u32,
+    session: Arc<super::connection::Session>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for Registration {
     fn drop(&mut self) {
-        // Removal of even one callback invalidates group coverage. Wake an idle consumer.
-        self.loss.closed.store(true, Ordering::Release);
-        let _ = self.sender.try_send(None);
+        let mut state = self.groups.0.lock().expect("publish routes");
+        state.routes.remove(&self.id);
+        state.changes = state.changes.wrapping_add(1);
+        drop(state);
+        let session = self.session.clone();
+        let id = self.id;
+        self.runtime.spawn(async move {
+            let _ = session
+                .request(ua::DeleteSubscriptionsRequest {
+                    subscription_ids: Some(vec![id]),
+                    ..Default::default()
+                })
+                .await;
+        });
+    }
+}
+
+impl GroupState {
+    fn stop(&mut self) {
+        for route in self.routes.values() {
+            route.end();
+        }
+        self.running = false;
+    }
+}
+
+impl PublishGroups {
+    fn register(
+        &self,
+        session: &Arc<super::connection::Session>,
+        id: u32,
+        route: Route,
+    ) -> Result<Registration, SubscriptionError> {
+        let mut state = self.0.lock().expect("publish routes");
+        if state.routes.contains_key(&id) {
+            return Err(SubscriptionError::InvalidRevision);
+        }
+        state.routes.insert(id, route);
+        state.changes = state.changes.wrapping_add(1);
+        if !state.running {
+            state.running = true;
+            tokio::spawn(self.clone().run(session.clone()));
+        }
+        Ok(Registration {
+            groups: self.clone(),
+            id,
+            session: session.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+
+    async fn run(self, session: Arc<super::connection::Session>) {
+        let mut ack = None;
+        loop {
+            let (timeout, changes) = {
+                let mut state = self.0.lock().expect("publish routes");
+                let Some(timeout) = state.routes.values().map(|r| r.timeout_ms).max() else {
+                    state.running = false;
+                    return;
+                };
+                (timeout, state.changes)
+            };
+            let sent: Option<ua::SubscriptionAcknowledgement> = ack.take();
+            let req = wire::publish(sent.iter().cloned().collect(), timeout);
+            let result = session.request(req).await;
+            let mut state = self.0.lock().expect("publish routes");
+            match result {
+                Ok(reply) => {
+                    let statuses = reply.results.as_deref().unwrap_or_default();
+                    if statuses.len() != usize::from(sent.is_some()) {
+                        state.stop();
+                        return;
+                    }
+                    if let Some(ack) = sent
+                        && !statuses[0].is_good()
+                        && let Some(route) = state.routes.get(&ack.subscription_id)
+                    {
+                        route.end();
+                    }
+                    if let Some(route) = state.routes.get_mut(&reply.subscription_id) {
+                        let seq = reply.notification_message.sequence_number;
+                        let available = reply
+                            .available_sequence_numbers
+                            .as_deref()
+                            .unwrap_or_default();
+                        if available.len() > 4096 {
+                            route.end();
+                            continue;
+                        }
+                        route.receive(&reply.notification_message);
+                        if reply
+                            .notification_message
+                            .notification_data
+                            .as_ref()
+                            .is_some_and(|n| !n.is_empty())
+                            && available.contains(&seq)
+                        {
+                            ack = Some(ua::SubscriptionAcknowledgement {
+                                subscription_id: reply.subscription_id,
+                                sequence_number: seq,
+                            });
+                        }
+                    }
+                }
+                Err(ua::StatusCode::BadNoSubscription) if changes != state.changes => continue,
+                Err(_) => {
+                    state.stop();
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -264,68 +442,47 @@ impl Client {
             .enumerate()
             .map(|(index, node)| metadata.namespaces.wire_node(node, index))
             .collect::<Result<Vec<_>, _>>()?;
-        let builder = SubscriptionBuilder::default()
-            .requested_publishing_interval(Some(interval))
-            .requested_max_keep_alive_count(NonZeroU32::new(10))
-            .requested_lifetime_count(60)
-            .max_notifications_per_publish(NonZeroU32::new(CAPACITY as u32));
-        let (reply, subscription) = self
-            .guarded(&mut session, builder.create(&self.inner))
-            .await?;
-        let publishing = reply
-            .revised_publishing_interval()
-            .map_err(|_| SubscriptionError::InvalidRevision)?;
-        if publishing.is_zero() || publishing > MAX_WAIT {
-            return Err(SubscriptionError::InvalidRevision);
-        }
-        let request = MonitoredItemCreateRequestBuilder::new(wire_nodes)
-            .sampling_interval(Some(interval))
-            .queue_size(CAPACITY as u32)
-            .discard_oldest(true);
-        let (tx, receiver) = mpsc::channel(CAPACITY);
+        let sub = wire::create_subscription(self, &mut session, interval).await?;
+        let (sender, receiver) = mpsc::channel(CAPACITY);
         let loss = Arc::new(Loss::default());
-        let callback = |index| {
-            let context = Callback {
-                sender: tx.clone(),
-                loss: Arc::clone(&loss),
-                index,
-            };
-            move |value| context.deliver(value)
-        };
-        let results = self
-            .guarded(
-                &mut session,
-                subscription.create_monitored_items_callback(request, callback),
-            )
-            .await?;
-        // The backend can omit a Good item with a missing ID. Never associate
-        // a subsequent result with the wrong node or expose a partial group.
-        if results.len() != nodes.len() {
-            return Err(SubscriptionError::InvalidRevision);
-        }
-        let mut items = Vec::with_capacity(nodes.len());
-        let mut handles = Vec::with_capacity(nodes.len());
-        for (index, (node, result)) in nodes.iter().zip(results).enumerate() {
-            let (reply, handle) =
-                result.map_err(|source| SubscriptionError::ItemRejected { index, source })?;
-            let sampling_interval = reply
-                .revised_sampling_interval()
-                .map_err(|_| SubscriptionError::ItemRevision { index })?;
-            let queue_size = reply.revised_queue_size();
-            // A revised queue of one coalesces without setting the Overflow info bit.
-            if sampling_interval.is_zero()
-                || sampling_interval > MAX_WAIT
-                || !(2..=CAPACITY as u32).contains(&queue_size)
-            {
-                return Err(SubscriptionError::ItemRevision { index });
+        let registration = self.publish_groups.register(
+            &self.inner,
+            sub.id,
+            Route {
+                sender,
+                loss: loss.clone(),
+                expected: 1,
+                count: nodes.len(),
+                timeout_ms: sub.timeout_ms,
+            },
+        )?;
+        let requests = wire_nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, node)| wire::item(node, 13, (i + 1) as u32, interval, Default::default()))
+            .collect();
+        let results = wire::create_items(self, &mut session, sub.id, requests).await?;
+        let items = match wire::revisions(nodes, &results) {
+            Ok(items) => items,
+            Err(error) => {
+                let accepted: Vec<_> = results
+                    .iter()
+                    .filter(|r| r.status_code.is_good() && r.monitored_item_id != 0)
+                    .map(|r| r.monitored_item_id)
+                    .collect();
+                if !accepted.is_empty() {
+                    let cleanup = ua::DeleteMonitoredItemsRequest {
+                        subscription_id: sub.id,
+                        monitored_item_ids: Some(accepted),
+                        ..Default::default()
+                    };
+                    let _ = self
+                        .guarded(&mut session, self.inner.request(cleanup))
+                        .await;
+                }
+                return Err(error);
             }
-            items.push(MonitoredNode {
-                node: node.clone(),
-                sampling_interval,
-                queue_size,
-            });
-            handles.push(handle);
-        }
+        };
         Ok(MonitoredDataChanges {
             client: self,
             receiver,
@@ -333,9 +490,8 @@ impl Client {
             loss,
             ended: false,
             items,
-            publishing,
-            _handles: handles,
-            _subscription: subscription,
+            publishing: sub.interval,
+            _registration: registration,
             _permit: permit,
         })
     }
@@ -356,10 +512,7 @@ impl DataChanges<'_> {
     }
 
     /// Wait for one DataValue. A timeout is retryable, and cancellation preserves a dequeued value.
-    pub async fn next(
-        &mut self,
-        wait: Duration,
-    ) -> Result<DataValue<ua::Variant>, SubscriptionError> {
+    pub async fn next(&mut self, wait: Duration) -> Result<DataValue, SubscriptionError> {
         match self.0.next(wait).await {
             Ok(change) => Ok(change.value),
             Err(SubscriptionError::ItemValueLimit { .. }) => Err(SubscriptionError::ValueLimit),
@@ -383,7 +536,7 @@ impl MonitoredDataChanges<'_> {
 
     fn healthy(&self) -> Result<(), SubscriptionError> {
         self.client.check_channel()?;
-        if self.client.inner.state().connect_status != ua::StatusCode::GOOD {
+        if !self.client.inner.is_alive() {
             return Err(SubscriptionError::Ended);
         }
         if self
@@ -414,7 +567,7 @@ impl MonitoredDataChanges<'_> {
     }
 
     /// Wait for one indexed DataValue, including its status and original clocks. A timeout is
-    /// retryable. An overflow, invalidated session or closed callback terminates delivery.
+    /// retryable. An overflow, invalidated session or closed subscription terminates delivery.
     /// A cancelled wait retains any notification dequeued before cancellation.
     pub async fn next(&mut self, wait: Duration) -> Result<DataChange, SubscriptionError> {
         if self.ended {
@@ -443,24 +596,21 @@ mod tests {
 
     #[test]
     fn count_and_binary_size_bounds_report_loss_without_delivering_an_oversized_payload() {
-        let bytes = |count| {
-            let data = ua::ByteString::new(&vec![0x5a; count]);
-            ua::DataValue::new(ua::Variant::scalar(data)).cast()
-        };
+        let bytes = |count| ua::DataValue::from(ua::Variant::ByteString(vec![0x5a; count].into()));
         let (tx, mut rx) = mpsc::channel(1);
         let loss = Loss::default();
-        loss.deliver(&tx, 0, bytes(MAX_VALUE_BYTES - 5));
+        loss.deliver(&tx, 0, &bytes(MAX_VALUE_BYTES - 5));
         assert!(loss.check().is_ok());
         assert!(rx.try_recv().unwrap().is_some());
-        loss.deliver(&tx, 0, bytes(MAX_VALUE_BYTES - 4));
+        loss.deliver(&tx, 0, &bytes(MAX_VALUE_BYTES - 4));
         assert!(matches!(
             loss.check(),
             Err(SubscriptionError::ItemValueLimit { index: 0 })
         ));
         assert!(rx.try_recv().unwrap().is_none());
         let loss = Loss::default();
-        loss.deliver(&tx, 0, bytes(0));
-        loss.deliver(&tx, 0, bytes(0));
+        loss.deliver(&tx, 0, &bytes(0));
+        loss.deliver(&tx, 0, &bytes(0));
         assert!(matches!(
             loss.check(),
             Err(SubscriptionError::LocalOverflow)
@@ -471,15 +621,17 @@ mod tests {
     fn removed_member_ends_the_group_while_another_sender_is_alive() {
         let (sender, mut rx) = mpsc::channel(2);
         let loss = Arc::new(Loss::default());
-        let callback = Callback {
+        let route = Route {
             sender: sender.clone(),
-            index: 1,
-            loss: Arc::clone(&loss),
+            loss: loss.clone(),
+            count: 2,
+            expected: 1,
+            timeout_ms: 1000,
         };
-        drop(callback);
+        route.end();
         assert!(rx.try_recv().unwrap().is_none());
         assert!(matches!(loss.check(), Err(SubscriptionError::Ended)));
-        loss.deliver(&sender, 0, ua::DataValue::init().cast());
+        loss.deliver(&sender, 0, &ua::DataValue::default());
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -487,12 +639,57 @@ mod tests {
     }
 
     #[test]
+    fn keepalive_and_notifications_advance_only_their_subscription_sequence() {
+        let (sender, mut rx) = mpsc::channel(2);
+        let loss = Arc::new(Loss::default());
+        let mut route = Route {
+            sender,
+            loss: loss.clone(),
+            count: 2,
+            expected: u32::MAX,
+            timeout_ms: 1000,
+        };
+        let mut message = ua::NotificationMessage {
+            sequence_number: u32::MAX,
+            ..Default::default()
+        };
+        route.receive(&message);
+        assert_eq!(route.expected, u32::MAX);
+        assert!(rx.try_recv().is_err());
+        message.notification_data =
+            Some(vec![ua::ExtensionObject::new(ua::DataChangeNotification {
+                monitored_items: Some(vec![ua::MonitoredItemNotification {
+                    client_handle: 2,
+                    value: ua::DataValue::from(17u32),
+                }]),
+                ..Default::default()
+            })]);
+        route.receive(&message);
+        let change = rx.try_recv().unwrap().unwrap();
+        assert_eq!(change.index, 1);
+        assert_eq!(change.value.value, Some(ua::Variant::UInt32(17)));
+        assert_eq!(route.expected, 1);
+        route.receive(&message);
+        assert!(matches!(
+            loss.check(),
+            Err(SubscriptionError::SequenceGap {
+                expected: 1,
+                actual: u32::MAX
+            })
+        ));
+        assert!(rx.try_recv().unwrap().is_none());
+    }
+
+    #[test]
     fn overflow_only_applies_to_the_data_value_info_type() {
         for (status, overflow) in [(0x80, false), (0x480, true), (0x4090_4480, true)] {
             let (tx, mut rx) = mpsc::channel(1);
             let loss = Loss::default();
-            let raw = ua::DataValue::init().with_status(ua::StatusCode::raw_ref(&status));
-            loss.deliver(&tx, 7, raw.cast());
+            let raw = ua::DataValue {
+                status: Some(ua::StatusCode::from(status)),
+                ..Default::default()
+            };
+            loss.deliver(&tx, 7, &raw);
             assert_eq!(
                 matches!(loss.check(), Err(SubscriptionError::ItemOverflow { index: 7, status: code }) if code == status),
                 overflow

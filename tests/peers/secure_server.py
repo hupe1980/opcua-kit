@@ -7,7 +7,11 @@ import tempfile
 from pathlib import Path
 
 from asyncua import Client, ua
-from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+from asyncua.crypto.security_policies import (
+    SecurityPolicyAes128Sha256RsaOaep,
+    SecurityPolicyAes256Sha256RsaPss,
+    SecurityPolicyBasic256Sha256,
+)
 from cryptography.hazmat.primitives import serialization
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,7 +19,7 @@ from capture_peer import certificate
 from local_server import denied
 
 
-async def run(binary, tmp, read_binary=None):
+async def run(binary, tmp, policy, read_binary=None):
     certificate(tmp, "server", uri="urn:example:server")
     certificate(tmp, "client", uri="urn:example:reader")
     foreign = tmp / "foreign"
@@ -41,6 +45,7 @@ async def run(binary, tmp, read_binary=None):
         str(tmp / "server-key.der"),
         "urn:example:reader",
         str(tmp / "client.der"),
+        policy.URI.rsplit("#", 1)[1],
         stdin=asyncio.subprocess.PIPE,
     )
 
@@ -48,7 +53,7 @@ async def run(binary, tmp, read_binary=None):
         client = Client(endpoint, timeout=2)
         client.application_uri = "urn:example:reader"
         await client.set_security(
-            SecurityPolicyBasic256Sha256,
+            policy,
             certificate=folder / "client.der",
             private_key=folder / "client-key.der",
             server_certificate=tmp / "server.der",
@@ -75,12 +80,15 @@ async def run(binary, tmp, read_binary=None):
                 assert endpoints and all(
                     item.SecurityMode == ua.MessageSecurityMode.SignAndEncrypt
                     and item.Server.ApplicationUri == "urn:example:server"
+                    and item.SecurityPolicyUri == policy.URI
                     and {token.TokenType for token in item.UserIdentityTokens}
                     == {ua.UserTokenType.Anonymous}
                     for item in endpoints
                 )
                 ns = await client.get_namespace_index("urn:example:line")
                 node = client.get_node(ua.NodeId("PartsProduced", ns))
+                assert await node.read_value() == 0
+                await client.open_secure_channel(renew=True)
                 assert await node.read_value() == 0
                 await denied(node.write_value(42, ua.VariantType.UInt64))
             finally:
@@ -109,17 +117,15 @@ async def run(binary, tmp, read_binary=None):
                 await configured(foreign, ua.MessageSecurityMode.SignAndEncrypt),
                 ua.StatusCodes.BadSecurityChecksFailed,
             ),
-            (await configured(tmp, ua.MessageSecurityMode.Sign), None),
+            (
+                await configured(tmp, ua.MessageSecurityMode.Sign),
+                ua.StatusCodes.BadSecurityModeRejected,
+            ),
         ]:
             try:
                 await candidate.connect()
             except ua.UaStatusCodeError as error:
                 assert error.code == rejection, error
-                continue
-            except ua.UaError as error:
-                assert rejection is None and "No matching endpoints" in str(error), (
-                    error
-                )
                 continue
             await candidate.disconnect()
             raise AssertionError("untrusted client or downgrade acquired a session")
@@ -132,16 +138,24 @@ async def run(binary, tmp, read_binary=None):
             await process.wait()
             raise
     print(
-        "Verified pinned SignAndEncrypt server, refused unknown application, plaintext and Sign-only sessions."
+        f"Verified {policy.URI.rsplit('#', 1)[1]} renewal, pinned reads and downgrade rejection."
     )
 
 
 if __name__ == "__main__":
-    with tempfile.TemporaryDirectory() as directory:
-        asyncio.run(
-            run(
-                sys.argv[1],
-                Path(directory),
-                sys.argv[2] if len(sys.argv) == 3 else None,
+    for policy in (
+        SecurityPolicyBasic256Sha256,
+        SecurityPolicyAes128Sha256RsaOaep,
+        SecurityPolicyAes256Sha256RsaPss,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            asyncio.run(
+                run(
+                    sys.argv[1],
+                    Path(directory),
+                    policy,
+                    sys.argv[2]
+                    if len(sys.argv) == 3 and policy is SecurityPolicyBasic256Sha256
+                    else None,
+                )
             )
-        )

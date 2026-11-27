@@ -78,7 +78,7 @@ pub struct RecoveringClient<'a> {
 
 fn session_health(client: &mut Client) -> Result<(), ReadError> {
     client.check_channel()?;
-    if client.reads.get_mut().interrupted || !client.inner.state().connect_status.is_good() {
+    if client.reads.get_mut().interrupted || !client.inner.is_alive() {
         return Err(ReadError::SessionInterrupted);
     }
     Ok(())
@@ -195,7 +195,7 @@ impl<'a> RecoveringClient<'a> {
         let retired = self.current.take();
         Ok(runtime.spawn(async move {
             let client = tokio::task::spawn_blocking(move || {
-                // An interrupted SDK driver's destructor can join its worker thread.
+                // An interrupted session driver's destructor can join its worker thread.
                 drop(retired);
                 let identity = match &login {
                     None => UserIdentity::Anonymous,
@@ -249,7 +249,7 @@ impl<'a> RecoveringClient<'a> {
 impl Drop for RecoveringClient<'_> {
     fn drop(&mut self) {
         if let Some(handle) = &self.connecting {
-            // A synchronous handshake already running on the worker ends at its SDK timeout.
+            // A synchronous handshake already running on the worker ends at its transport timeout.
             handle.abort();
         }
     }

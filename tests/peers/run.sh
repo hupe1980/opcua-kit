@@ -4,11 +4,17 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 temp=$(mktemp -d)
 trap 'rm -rf "$temp"' EXIT
+if [[ -n "${OPCUA_KIT_BIN:-}" ]]; then
+  OPCUA_KIT_BIN=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$OPCUA_KIT_BIN")
+  export OPCUA_KIT_BIN
+fi
 cd "$root"
+target_dir=$(cargo metadata --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 if [[ -z "${OPCUA_KIT_BIN:-}" ]]; then
-  cargo build --locked --features cli,cems --bin opcua-kit
-  target_dir=$(cargo metadata --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-  export OPCUA_KIT_BIN="$target_dir/debug/opcua-kit"
+  # Isolate the executable from concurrent builds using different Cargo features.
+  cargo install --locked --debug --path . --features cli,cems --bin opcua-kit \
+    --target-dir "$target_dir" --root "$temp/cli"
+  export OPCUA_KIT_BIN="$temp/cli/bin/opcua-kit"
 fi
 if [[ -z "${OPCUA_KIT_NATIVE_PEER_BIN:-}" || -z "${OPCUA_KIT_NATIVE_COMMISSIONING_BIN:-}" ]]; then
   mkdir -p "$temp/consumer/src"
@@ -27,12 +33,11 @@ publish = false
 commissioning = ["opcua-kit/cems", "dep:serde_json", "dep:time"]
 
 [dependencies]
-opcua-kit = { path = "../kit" }
+opcua-kit = { path = "../kit", features = ["client"] }
 serde_json = { version = "1", optional = true }
 time = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 TOML
-  target_dir=$(cargo metadata --format-version=1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
   if [[ -z "${OPCUA_KIT_NATIVE_PEER_BIN:-}" ]]; then
     cargo build --manifest-path "$temp/consumer/Cargo.toml" --target-dir "$target_dir"
     cp "$target_dir/debug/opcua-kit-peer-consumer" "$temp/default-consumer"
@@ -46,4 +51,6 @@ TOML
 fi
 npm install --prefix "$temp" --ignore-scripts --no-audit --no-fund --save-exact node-opcua@2.187.34 >/dev/null
 export NODE_PATH="$temp/node_modules"
-uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python "$root/tests/capture_peer.py" -v
+peer_python=(uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python)
+"${peer_python[@]}" "$root/tests/capture_peer.py" -v
+"${peer_python[@]}" "$root/tests/peers/field_commands.py" "$OPCUA_KIT_BIN"

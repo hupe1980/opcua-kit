@@ -1,4 +1,4 @@
-use open62541::{DataType, DataValue, ua};
+use crate::client::{DataValue, ua};
 
 use super::{Contract, Expected, FloatingBits, Instant, MeterReading, OffsetDateTime, Reading};
 use crate::{MeterReadError, Sample, SampleTimestamp, Scalar, Severity, status_severity};
@@ -12,13 +12,13 @@ fn clock(
     name: &'static str,
 ) -> Result<Option<Instant>, MeterReadError> {
     let Some(base) = base else { return Ok(None) };
-    let nanos = base.as_unix_timestamp_nanos();
+    let nanos = base.unix_timestamp_nanos();
     // Part 6 §5.2.2.5 and §5.2.2.17. DateTime.MinValue means the clock is
     // absent. An orphaned picoseconds field supplies no independent instant.
     if nanos == UA_EPOCH_UNIX_NANOS {
         return Ok(None);
     }
-    if nanos < UA_EPOCH_UNIX_NANOS {
+    if nanos < UA_EPOCH_UNIX_NANOS || *base == ua::DateTime::endtimes() {
         return Err(MeterReadError::InvalidTimestamp { clock: name });
     }
     SampleTimestamp {
@@ -32,7 +32,7 @@ fn clock(
     .ok_or(MeterReadError::InvalidTimestamp { clock: name })
 }
 
-fn scalar<T: Scalar>(raw: &DataValue<ua::Variant>) -> Result<T, MeterReadError> {
+fn scalar<T: Scalar>(raw: &DataValue) -> Result<T, MeterReadError> {
     Sample::<T>::from_raw(raw)?
         .value
         .ok_or(MeterReadError::MissingValue)
@@ -40,7 +40,7 @@ fn scalar<T: Scalar>(raw: &DataValue<ua::Variant>) -> Result<T, MeterReadError> 
 
 fn payload(
     dtype: &str,
-    raw: &DataValue<ua::Variant>,
+    raw: &DataValue,
     status: u32,
 ) -> Result<(Option<u64>, Option<FloatingBits>), MeterReadError> {
     // OPC UA Part 4 §7.11.1. Keep the operation status and clocks even when
@@ -69,10 +69,10 @@ impl MeterReading {
     pub(crate) fn from_live(
         contract: &Contract,
         signal: &Expected,
-        raw: &DataValue<ua::Variant>,
+        raw: &DataValue,
         received_at: OffsetDateTime,
     ) -> Result<Self, MeterReadError> {
-        let status = raw.status().map_or(0, DataType::into_raw);
+        let status = raw.status.map_or(0, |s| s.bits());
         let (value, value_bits) = payload(signal.data_type.identifier(), raw, status)?;
         let reading = Reading {
             schema_version: 1,
@@ -90,8 +90,16 @@ impl MeterReading {
             received_at: Instant::utc(received_at).ok_or(MeterReadError::InvalidTimestamp {
                 clock: "receivedAt",
             })?,
-            source_at: clock(raw.source_timestamp(), raw.source_picoseconds(), "sourceAt")?,
-            server_at: clock(raw.server_timestamp(), raw.server_picoseconds(), "serverAt")?,
+            source_at: clock(
+                raw.source_timestamp.as_ref(),
+                raw.source_picoseconds,
+                "sourceAt",
+            )?,
+            server_at: clock(
+                raw.server_timestamp.as_ref(),
+                raw.server_picoseconds,
+                "serverAt",
+            )?,
             status,
             value,
             value_bits,
@@ -128,7 +136,7 @@ mod tests {
         MeterReading::from_live(
             c,
             meter_signal(c).unwrap(),
-            &raw.cast(),
+            &raw,
             OffsetDateTime::UNIX_EPOCH,
         )
     }
@@ -140,49 +148,51 @@ mod tests {
         for (dtype, payload, integer, single, double) in [
             (
                 "i=7",
-                ua::Variant::scalar(ua::UInt32::new(u32::MAX)),
+                ua::Variant::UInt32(u32::MAX),
                 Some(u64::from(u32::MAX)),
                 None,
                 None,
             ),
             (
                 "i=9",
-                ua::Variant::scalar(ua::UInt64::new(u64::MAX)),
+                ua::Variant::UInt64(u64::MAX),
                 Some(u64::MAX),
                 None,
                 None,
             ),
             (
                 "i=10",
-                ua::Variant::scalar(ua::Float::new(f32::from_bits(float_word))),
+                ua::Variant::Float(f32::from_bits(float_word)),
                 None,
                 Some(float_word),
                 None,
             ),
             (
                 "i=11",
-                ua::Variant::scalar(ua::Double::new(f64::from_bits(double_word))),
+                ua::Variant::Double(f64::from_bits(double_word)),
                 None,
                 None,
                 Some(double_word),
             ),
             (
                 "i=11",
-                ua::Variant::scalar(ua::Double::new(-0.0)),
+                ua::Variant::Double(-0.0),
                 None,
                 None,
                 Some((-0.0f64).to_bits()),
             ),
         ] {
             let c = contract(dtype);
-            let source = ua::DateTime::try_from_unix_timestamp_nanos(-100).unwrap();
-            let server = ua::DateTime::try_from_unix_timestamp_nanos(200).unwrap();
-            let raw = ua::DataValue::new(payload)
-                .with_status(&ua::StatusCode::GOODCLAMPED)
-                .with_source_timestamp(&source)
-                .with_source_picoseconds(9900)
-                .with_server_timestamp(&server)
-                .with_server_picoseconds(100);
+            let source = ua::DateTime::from_unix_timestamp_nanos(-100).unwrap();
+            let server = ua::DateTime::from_unix_timestamp_nanos(200).unwrap();
+            let raw = ua::DataValue {
+                status: Some(ua::StatusCode::GoodClamped),
+                source_timestamp: Some(source),
+                source_picoseconds: Some(9900),
+                server_timestamp: Some(server),
+                server_picoseconds: Some(100),
+                ..ua::DataValue::value_only(payload)
+            };
             let valid = from_raw(&c, raw).unwrap();
             let encoded = serde_json::to_vec(&valid).unwrap();
             let parsed = parse_meter_reading(&c, &encoded).unwrap();
@@ -190,7 +200,7 @@ mod tests {
                 (parsed.value(), parsed.value_bits(), parsed.double_bits()),
                 (integer, single, double)
             );
-            assert_eq!(parsed.status(), ua::StatusCode::GOODCLAMPED.into_raw());
+            assert_eq!(parsed.status(), ua::StatusCode::GoodClamped.bits());
             assert_eq!(parsed.source_at().unwrap().unix_timestamp_nanos(), -1);
             assert_eq!(parsed.server_at().unwrap().unix_timestamp_nanos(), 201);
             assert_eq!(parsed.received_at(), OffsetDateTime::UNIX_EPOCH);
@@ -201,7 +211,7 @@ mod tests {
     #[test]
     fn native_evidence_reserves_one_byte_for_the_line_delimiter() {
         let c = contract("i=9");
-        let value = || ua::DataValue::new(ua::Variant::scalar(ua::UInt64::new(u64::MAX)));
+        let value = || ua::DataValue::value_only(ua::Variant::UInt64(u64::MAX));
         let baseline = serde_json::to_vec(&from_raw(&c, value()).unwrap())
             .unwrap()
             .len();
@@ -227,34 +237,37 @@ mod tests {
     fn non_good_omits_payload_and_malformed_or_absent_good_payload_fails() {
         let c = contract("i=9");
         for status in [
-            ua::StatusCode::UNCERTAINLASTUSABLEVALUE,
-            ua::StatusCode::BADNODEIDUNKNOWN,
-            ua::StatusCode::raw_ref(&0xc000_0400).clone(),
+            ua::StatusCode::UncertainLastUsableValue,
+            ua::StatusCode::BadNodeIdUnknown,
+            ua::StatusCode::from(0xc000_0400),
         ] {
             for raw in [
-                ua::DataValue::init(),
-                ua::DataValue::new(ua::Variant::scalar(ua::UInt64::new(19))),
-                ua::DataValue::new(ua::Variant::array(ua::Array::from_slice(&[
-                    ua::Int64::new(19),
-                ]))),
+                ua::DataValue::default(),
+                ua::DataValue::value_only(ua::Variant::UInt64(19)),
+                ua::DataValue::value_only(ua::Variant::from(vec![19i64])),
             ] {
-                let instant = ua::DateTime::try_from_unix_timestamp_nanos(100).unwrap();
-                let reading =
-                    from_raw(&c, raw.with_source_timestamp(&instant).with_status(&status)).unwrap();
+                let instant = ua::DateTime::from_unix_timestamp_nanos(100).unwrap();
+                let reading = from_raw(
+                    &c,
+                    ua::DataValue {
+                        source_timestamp: Some(instant),
+                        status: Some(status),
+                        ..raw
+                    },
+                )
+                .unwrap();
                 assert_eq!(reading.source_at().unwrap().unix_timestamp_nanos(), 100);
                 assert!(reading.server_at().is_none());
-                assert_eq!(reading.status(), status.clone().into_raw());
+                assert_eq!(reading.status(), status.bits());
                 let encoded = serde_json::to_value(reading).unwrap();
                 assert!(encoded.get("value").is_none() && encoded.get("valueBits").is_none());
             }
         }
         assert!(matches!(
-            from_raw(&c, ua::DataValue::init()),
+            from_raw(&c, ua::DataValue::default()),
             Err(MeterReadError::MissingValue)
         ));
-        let wrong_rank = ua::DataValue::new(ua::Variant::array(ua::Array::from_slice(&[
-            ua::UInt64::new(4),
-        ])));
+        let wrong_rank = ua::DataValue::value_only(ua::Variant::from(vec![4u64]));
         assert!(matches!(
             from_raw(&c, wrong_rank),
             Err(MeterReadError::Read(ReadError::ScalarTypeMismatch { .. }))
@@ -264,7 +277,7 @@ mod tests {
     #[test]
     fn meter_clock_ignores_missing_or_zero_base_and_rejects_inexact_or_sentinel_time() {
         assert!(clock(None, Some(1), "sourceAt").unwrap().is_none());
-        let timestamp = |nanos| ua::DateTime::try_from_unix_timestamp_nanos(nanos).unwrap();
+        let timestamp = |nanos| ua::DateTime::from_unix_timestamp_nanos(nanos).unwrap();
         assert!(
             clock(
                 Some(&timestamp(UA_EPOCH_UNIX_NANOS)),

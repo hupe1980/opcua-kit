@@ -1,4 +1,3 @@
-use open62541::DataType;
 use time::OffsetDateTime;
 
 use super::{DataValue, ReadError, ua};
@@ -27,7 +26,7 @@ pub enum TimestampError {
 impl SampleTimestamp {
     pub(super) fn from_parts(base: Option<&ua::DateTime>, increments: Option<u16>) -> Option<Self> {
         base.map(|base| Self {
-            base_unix_nanos: base.as_unix_timestamp_nanos(),
+            base_unix_nanos: base.unix_timestamp_nanos(),
             ten_picoseconds: increments,
         })
     }
@@ -47,7 +46,7 @@ impl SampleTimestamp {
     }
 }
 
-/// One typed Value attribute, with the full per-node status and independent server clocks.
+/// One typed Value attribute, with its per-node status and optional source and server timestamps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample<T> {
     /// OPC UA StatusCode, including subcodes and flags. An omitted status means Good (0).
@@ -80,66 +79,46 @@ impl Quality {
 
 impl<T: Scalar> Sample<T> {
     /// Decode one raw result, including a member of a heterogeneous [`super::Client::read_many`] batch.
-    pub fn from_raw(raw: &DataValue<ua::Variant>) -> Result<Self, ReadError> {
+    pub fn from_raw(raw: &DataValue) -> Result<Self, ReadError> {
         Self::from_raw_with(raw, Quality::GoodSeverity)
     }
 
-    pub(super) fn from_raw_with(
-        raw: &DataValue<ua::Variant>,
-        quality: Quality,
-    ) -> Result<Self, ReadError> {
+    pub(super) fn from_raw_with(raw: &DataValue, quality: Quality) -> Result<Self, ReadError> {
         Self::decode_with(raw, quality, T::decode)
     }
 }
 
 impl<T> Sample<T> {
     pub(super) fn decode_with(
-        raw: &DataValue<ua::Variant>,
+        raw: &DataValue,
         quality: Quality,
         decode: impl FnOnce(&ua::Variant) -> Result<Option<T>, ReadError>,
     ) -> Result<Self, ReadError> {
-        let status = raw.status().map_or(0, DataType::into_raw);
-        let value = match raw.value() {
-            Some(v) if quality.accepts(status) && !v.is_empty() => decode(v)?,
+        let status = raw.status.map_or(0, |s| s.bits());
+        let value = match raw.value.as_ref() {
+            Some(v) if quality.accepts(status) && !matches!(v, ua::Variant::Empty) => decode(v)?,
             _ => None,
         };
         Ok(Self {
             status,
             value,
             source_timestamp: SampleTimestamp::from_parts(
-                raw.source_timestamp(),
-                raw.source_picoseconds(),
+                raw.source_timestamp.as_ref(),
+                raw.source_picoseconds,
             ),
             server_timestamp: SampleTimestamp::from_parts(
-                raw.server_timestamp(),
-                raw.server_picoseconds(),
+                raw.server_timestamp.as_ref(),
+                raw.server_picoseconds,
             ),
         })
     }
 }
 
-// Project SDK service responses by reference, without cloning an untrusted Variant.
 pub(super) fn decode_borrowed<T>(
-    raw: &ua::DataValue,
+    raw: &DataValue,
     decode: impl FnOnce(&ua::Variant) -> Result<Option<T>, ReadError>,
 ) -> Result<Sample<T>, ReadError> {
-    let status = raw.status().map_or(0, DataType::into_raw);
-    let value = match raw.value() {
-        Some(v) if Quality::GoodSeverity.accepts(status) && !v.is_empty() => decode(v)?,
-        _ => None,
-    };
-    Ok(Sample {
-        status,
-        value,
-        source_timestamp: SampleTimestamp::from_parts(
-            raw.source_timestamp(),
-            raw.source_picoseconds(),
-        ),
-        server_timestamp: SampleTimestamp::from_parts(
-            raw.server_timestamp(),
-            raw.server_picoseconds(),
-        ),
-    })
+    Sample::decode_with(raw, Quality::GoodSeverity, decode)
 }
 
 pub(super) fn exact_datetime(time: time::OffsetDateTime) -> Option<ua::DateTime> {
@@ -151,7 +130,7 @@ pub(super) fn exact_datetime(time: time::OffsetDateTime) -> Option<ua::DateTime>
     {
         return None;
     }
-    ua::DateTime::try_from_unix_timestamp_nanos(ns).ok()
+    ua::DateTime::from_unix_timestamp_nanos(ns)
 }
 
 /// A Rust type with an exact built-in OPC UA scalar mapping.
@@ -161,7 +140,7 @@ pub(super) fn exact_datetime(time: time::OffsetDateTime) -> Option<ua::DateTime>
 pub trait Scalar: sealed::Decode {
     /// Decode one Variant with this exact wire type. A null Variant or null string/bytes yields None.
     fn from_variant(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-        if value.is_empty() {
+        if matches!(value, ua::Variant::Empty) {
             return Ok(None);
         }
         Self::decode(value)
@@ -181,8 +160,7 @@ impl<T: Scalar + sealed::Element> FixedScalar for T {}
 
 mod sealed {
     pub trait Element {
-        type Wire: open62541::DataType;
-        fn element(value: &Self::Wire) -> Self;
+        const TYPE: ua::VariantScalarTypeId;
     }
     use super::{ReadError, ua};
 
@@ -195,18 +173,15 @@ mod sealed {
     macro_rules! scalars {
         ($($rust:ty => $wire:ident),+ $(,)?) => {$(
             impl Element for $rust {
-                type Wire=ua::$wire;
-                fn element(value:&Self::Wire)->Self { value.value() }
+                const TYPE: ua::VariantScalarTypeId = ua::VariantScalarTypeId::$wire;
             }
             impl Decode for $rust {
                 #[cfg(feature = "control")]
                 fn encode(self) -> Result<ua::Variant, super::super::ControlError> {
-                    Ok(ua::Variant::scalar(ua::$wire::new(self)))
+                    Ok(ua::Variant::$wire(self))
                 }
                 fn decode(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-                    let scalar = value.as_scalar::<ua::$wire>()
-                        .ok_or(ReadError::ScalarTypeMismatch { expected: stringify!($wire) })?;
-                    Ok(Some(scalar.value()))
+                    match value { ua::Variant::$wire(v) => Ok(Some(*v)), _ => Err(ReadError::ScalarTypeMismatch { expected: stringify!($wire) }) }
                 }
             }
         )+};
@@ -225,35 +200,28 @@ mod sealed {
             if self.len() > MAX_BYTES - 5 {
                 return Err(ControlError::InputLimit);
             }
-            Ok(ua::Variant::scalar(ua::ByteString::new(&self)))
+            Ok(ua::Variant::ByteString(self.into()))
         }
         fn decode(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-            let bytes =
-                value
-                    .as_scalar::<ua::ByteString>()
-                    .ok_or(ReadError::ScalarTypeMismatch {
-                        expected: "ByteString",
-                    })?;
-            Ok(bytes.as_bytes().map(<[u8]>::to_vec))
+            match value {
+                ua::Variant::ByteString(bytes) => Ok(bytes.value.clone()),
+                _ => Err(ReadError::ScalarTypeMismatch {
+                    expected: "ByteString",
+                }),
+            }
         }
     }
 
     impl Decode for uuid::Uuid {
         #[cfg(feature = "control")]
         fn encode(self) -> Result<ua::Variant, super::super::ControlError> {
-            let (a, b, c, d) = self.as_fields();
-            Ok(ua::Variant::scalar(ua::Guid::new(a, b, c, *d)))
+            Ok(ua::Variant::Guid(Box::new(self)))
         }
         fn decode(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-            let guid = value
-                .as_scalar::<ua::Guid>()
-                .ok_or(ReadError::ScalarTypeMismatch { expected: "Guid" })?;
-            Ok(Some(Self::from_fields(
-                guid.data1(),
-                guid.data2(),
-                guid.data3(),
-                &guid.data4(),
-            )))
+            match value {
+                ua::Variant::Guid(id) => Ok(Some(**id)),
+                _ => Err(ReadError::ScalarTypeMismatch { expected: "Guid" }),
+            }
         }
     }
 
@@ -261,16 +229,16 @@ mod sealed {
         #[cfg(feature = "control")]
         fn encode(self) -> Result<ua::Variant, super::super::ControlError> {
             super::exact_datetime(self)
-                .map(ua::Variant::scalar)
+                .map(|v| ua::Variant::DateTime(Box::new(v)))
                 .ok_or(super::super::ControlError::InvalidDateTime)
         }
         fn decode(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-            let date = value
-                .as_scalar::<ua::DateTime>()
-                .ok_or(ReadError::ScalarTypeMismatch {
+            let ua::Variant::DateTime(date) = value else {
+                return Err(ReadError::ScalarTypeMismatch {
                     expected: "DateTime",
-                })?;
-            Self::from_unix_timestamp_nanos(date.as_unix_timestamp_nanos())
+                });
+            };
+            Self::from_unix_timestamp_nanos(date.unix_timestamp_nanos())
                 .map(Some)
                 .map_err(|_| ReadError::DateTimeRange)
         }
@@ -283,20 +251,13 @@ mod sealed {
             if self.len() > MAX_BYTES - 5 {
                 return Err(ControlError::InputLimit);
             }
-            let text = ua::String::new(&self).map_err(|_| ControlError::InvalidString)?;
-            Ok(ua::Variant::scalar(text))
+            Ok(ua::Variant::String(self.into()))
         }
         fn decode(value: &ua::Variant) -> Result<Option<Self>, ReadError> {
-            let text = value
-                .as_scalar::<ua::String>()
-                .ok_or(ReadError::ScalarTypeMismatch { expected: "String" })?;
-            text.as_bytes()
-                .map(|bytes| {
-                    std::str::from_utf8(bytes)
-                        .map(str::to_owned)
-                        .map_err(|_| ReadError::InvalidString)
-                })
-                .transpose()
+            match value {
+                ua::Variant::String(s) => Ok(s.value().clone()),
+                _ => Err(ReadError::ScalarTypeMismatch { expected: "String" }),
+            }
         }
     }
 }
@@ -308,19 +269,19 @@ mod tests {
     // Preserve the wire quality and independent clocks.
     #[test]
     fn typed_results_preserve_qualified_status_and_clock_evidence() {
-        let base = ua::DateTime::try_from_unix_timestamp_nanos(100).unwrap();
-        let value = ua::DataValue::new(ua::Variant::scalar(ua::UInt64::new(u64::MAX)))
-            .with_source_timestamp(&base)
-            .with_source_picoseconds(201)
-            .with_server_picoseconds(600);
-        let good = Sample::<u64>::from_raw(
-            &value
-                .clone()
-                .with_status(&ua::StatusCode::GOODCLAMPED)
-                .cast(),
-        )
+        let base = ua::DateTime::from_unix_timestamp_nanos(100).unwrap();
+        let value = ua::DataValue {
+            source_timestamp: Some(base),
+            source_picoseconds: Some(201),
+            server_picoseconds: Some(600),
+            ..ua::DataValue::value_only(ua::Variant::UInt64(u64::MAX))
+        };
+        let good = Sample::<u64>::from_raw(&ua::DataValue {
+            status: Some(ua::StatusCode::GoodClamped),
+            ..value.clone()
+        })
         .unwrap();
-        assert_eq!(good.status, ua::StatusCode::GOODCLAMPED.into_raw());
+        assert_eq!(good.status, ua::StatusCode::GoodClamped.bits());
         assert_eq!(good.value, Some(u64::MAX));
         assert_eq!(good.source_timestamp.unwrap().ten_picoseconds, Some(201));
         assert_eq!(
@@ -329,12 +290,15 @@ mod tests {
         );
         assert_eq!(good.server_timestamp, None);
         for status in [
-            ua::StatusCode::UNCERTAINLASTUSABLEVALUE,
-            ua::StatusCode::BADNODEIDUNKNOWN,
+            ua::StatusCode::UncertainLastUsableValue,
+            ua::StatusCode::BadNodeIdUnknown,
         ] {
-            let raw = value.clone().with_status(&status).cast();
+            let raw = ua::DataValue {
+                status: Some(status),
+                ..value.clone()
+            };
             let result = Sample::<u64>::from_raw(&raw).unwrap();
-            assert_eq!(result.status, status.into_raw());
+            assert_eq!(result.status, status.bits());
             assert_eq!(result.value, None);
             assert_eq!(result.source_timestamp, good.source_timestamp);
         }
@@ -342,22 +306,21 @@ mod tests {
 
     #[test]
     fn exact_wire_type_distinguishes_arrays_null_strings_and_empty_strings() {
-        let null = ua::DataValue::new(ua::Variant::scalar(ua::String::null())).cast();
+        let null = ua::DataValue::value_only(ua::Variant::from(ua::UAString::null()));
         assert_eq!(Sample::<String>::from_raw(&null).unwrap().value, None);
-        let empty = ua::DataValue::new(ua::Variant::scalar(ua::String::new("").unwrap())).cast();
+        let empty = ua::DataValue::value_only(ua::Variant::from(ua::UAString::from("")));
         assert_eq!(
             Sample::<String>::from_raw(&empty).unwrap().value.as_deref(),
             Some("")
         );
-        let array = ua::Array::from_slice(&[ua::UInt32::new(1)]);
-        let raw = ua::DataValue::new(ua::Variant::array(array)).cast();
+        let array = vec![1u32];
+        let raw = ua::DataValue::value_only(ua::Variant::from(array));
         assert!(matches!(
             Sample::<u32>::from_raw(&raw),
             Err(ReadError::ScalarTypeMismatch { expected: "UInt32" })
         ));
         let bits = 0xfff8_0000_0000_0001;
-        let raw =
-            ua::DataValue::new(ua::Variant::scalar(ua::Double::new(f64::from_bits(bits)))).cast();
+        let raw = ua::DataValue::value_only(ua::Variant::Double(f64::from_bits(bits)));
         assert_eq!(
             Sample::<f64>::from_raw(&raw)
                 .unwrap()
@@ -370,7 +333,7 @@ mod tests {
 
     #[test]
     fn clock_conversion_requires_the_exact_tick_and_fraction() {
-        let base = ua::DateTime::try_from_unix_timestamp_nanos(-100).unwrap();
+        let base = ua::DateTime::from_unix_timestamp_nanos(-100).unwrap();
         for (increments, expected) in [(None, -100), (Some(100), -99), (Some(9900), -1)] {
             let stamp = SampleTimestamp::from_parts(Some(&base), increments).unwrap();
             assert_eq!(stamp.ten_picoseconds, increments);

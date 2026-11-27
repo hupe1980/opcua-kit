@@ -149,7 +149,7 @@ impl Client {
         verify_units(units)?;
         let wire = metadata.namespaces.wire_node(&signal.node, 0)?;
         let raw = self
-            .one_attribute(&mut session, wire, ua::AttributeId::VALUE)
+            .one_attribute(&mut session, wire, ua::AttributeId::Value)
             .await?;
         let received_at = OffsetDateTime::now_utc();
         drop(session);

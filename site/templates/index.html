@@ -1,28 +1,29 @@
 {% extends "base.html" %}
 {% block body %}
-<div class="wrap landing">
-  <section class="hero" aria-labelledby="hero-title">
+<div class="hero-band"><section class="wrap hero" aria-labelledby="hero-title">
     <div class="hero-copy">
       <h1 id="hero-title">OPC UA<br><em>for Rust.</em></h1>
-      <p>Read typed signals from industrial equipment, expose application variables or exchange PubSub datasets with an embeddable Rust library.</p>
-      <div class="actions"><a class="button primary" href="{{ get_url(path='@/client.md') }}">Connect a client</a><a class="button" href="{{ get_url(path='@/documentation.md') }}">Explore the docs</a></div>
+      <p>Read a PLC, monitor a production line, or serve your own variables. Embed OPC UA directly in your Rust application.</p>
+      <pre class="install"><code>cargo add opcua-kit --features client</code></pre>
+      <div class="actions"><a class="button primary" href="{{ get_url(path='@/client.md') }}">Connect a client</a><a class="button" href="{{ get_url(path='@/documentation.md') }}">Browse guides</a></div>
     </div>
     <figure class="plate">
       <img src="{{ get_url(path='manipulator.webp') }}" width="960" height="640" fetchpriority="high" alt="Technical illustration of an articulated industrial robot arm">
       <figcaption><span>Example NodeId</span><code>nsu=urn:factory:line-1;s=AxisPosition</code></figcaption>
     </figure>
-  </section>
+  </section></div>
+<div class="wrap landing">
   <section class="roles" aria-labelledby="role-title">
     <h2 id="role-title">Choose a protocol role</h2>
     <div class="role-grid">
       <a class="role" href="{{ get_url(path='@/client.md') }}"><code>client</code><h3>Observe a device</h3><p>Browse variables, read typed values and subscribe to changes or alarm events.</p></a>
-      <a class="role" href="{{ get_url(path='@/services.md') }}#serve-a-host-owned-variable"><code>server</code><h3>Serve your data</h3><p>Expose application-owned variables for other OPC UA clients to read.</p></a>
-      <a class="role" href="{{ get_url(path='@/services.md') }}#exchange-a-uadp-dataset"><code>pubsub</code><h3>Exchange datasets</h3><p>Encode and decode UADP key frames. Your application supplies the transport.</p></a>
+      <a class="role" href="{{ get_url(path='@/services.md') }}#serve-a-host-owned-variable"><code>server</code><h3>Serve your data</h3><p>Expose application-owned variables for other OPC UA clients to read and monitor.</p></a>
+      <a class="role" href="{{ get_url(path='@/services.md') }}#exchange-a-uadp-dataset"><code>pubsub</code><h3>Exchange datasets</h3><p>Exchange unsigned scalar key frames over a transport you supply, including on no_std targets with an allocator.</p></a>
     </div>
   </section>
   <section class="read-demo" aria-labelledby="read-title">
     <div><h2 id="read-title">Read a variable</h2><p>Address a signal by namespace URI and identifier. Each sample carries the server’s status and the available timestamps alongside its value.</p><a class="text-link" href="{{ get_url(path='@/client.md') }}#open-a-session">Set up the session</a></div>
-    <div class="code-panel"><div class="file-label">Rust <span>·</span> connected client</div><pre tabindex="0"><code><b>use</b> opcua_kit::{NodeId, Sample};
+    <div class="code-panel"><div class="file-label">Rust <span>·</span> client.read_scalar</div><pre tabindex="0"><code><b>use</b> opcua_kit::{NodeId, Sample};
 
 <b>let</b> axis = NodeId::new(
     <i>"urn:factory:line-1"</i>, <i>"s=AxisPosition"</i>,

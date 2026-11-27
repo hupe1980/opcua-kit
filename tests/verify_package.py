@@ -14,18 +14,14 @@ def cargo(*args):
     ).stdout
 
 
-def verify_library_consumer(
-    root, source, rust_version, name, *, offline_feature=None, wrapper_override=None
-):
+def verify_library_consumer(root, source, rust_version, name, *, profile=None):
     consumer = root / name
     (consumer / "src").mkdir(parents=True)
     manifest = consumer / "Cargo.toml"
     features = (
-        f', default-features = false, features = ["{offline_feature}"]'
-        if offline_feature
-        else ""
+        f', default-features = false, features = ["{profile}"]' if profile else ""
     )
-    time_dep = 'time = "0.3"' if offline_feature == "cems" else ""
+    time_dep = 'time = "0.3"' if profile == "cems" else ""
     content = f"""[package]
 name = "consumer-{name}"
 version = "0.0.0"
@@ -36,14 +32,13 @@ rust-version = "{rust_version}"
 opcua-kit = {{ path = {json.dumps(str(source), ensure_ascii=False)}{features} }}
 {time_dep}
 """
-    if wrapper_override:
-        content += f"\n[patch.crates-io]\nopen62541 = {{ path = {json.dumps(str(wrapper_override))} }}\n"
     manifest.write_text(content)
     source_file = {
         None: "default.rs",
+        "client": "session.rs",
         "commissioning": "commissioning.rs",
         "cems": "meter.rs",
-    }[offline_feature]
+    }[profile]
     (consumer / "src/main.rs").write_bytes(
         (source / "tests/consumer" / source_file).read_bytes()
     )
@@ -59,25 +54,25 @@ opcua-kit = {{ path = {json.dumps(str(source), ensure_ascii=False)}{features} }}
         )
         if package == "opcua-kit":
             expected = (
-                {"commissioning", offline_feature}
-                if offline_feature
-                else {"client", "default"}
+                {"commissioning", profile}
+                if profile
+                else {"discovery", "default", "pubsub"}
             )
+            if profile == "client":
+                expected = {"client", "discovery"}
             assert set(node["features"]) == expected, node
         if package == "time":
             assert "local-offset" not in node["features"], node
-    assert ("open62541" in names.values()) == (offline_feature is None)
-    if offline_feature == "commissioning":
+    if profile is None:
+        assert set(names.values()) == {"opcua-kit", f"consumer-{name}"}, names
+    if profile == "commissioning":
         assert "time" not in names.values()
-    if offline_feature is None:
-        wrapper = next(p for p in graph["packages"] if p["name"] == "open62541")
-        if (source / "vendor/open62541/Cargo.toml").is_file() or wrapper_override:
-            assert wrapper["source"] is None and "pastey" in names.values()
-            assert "paste" not in names.values()
-        else:
-            assert wrapper["source"].startswith("registry+")
-    fixture = "meter" if offline_feature == "cems" else "commissioning"
-    run_args = [str(source / "fixtures" / fixture)] if offline_feature else []
+    fixture = "meter" if profile == "cems" else "commissioning"
+    run_args = (
+        [str(source / "fixtures" / fixture)]
+        if profile in ("commissioning", "cems")
+        else []
+    )
     cargo("run", "--locked", *args, "--", *run_args)
     print(f"Verified {name} Rust consumer.")
 
@@ -97,8 +92,8 @@ if options.allow_dirty:
 cargo("package", *package_args)
 files = cargo("package", *package_args, "--list").splitlines()
 assert "fixtures/units/contract.json" in files
-assert {"CHANGELOG.md", "CONTRIBUTING.md"} <= set(files)
-assert "contrib/open62541-pastey.patch" in files
+assert {"CHANGELOG.md", "CONTRIBUTING.md", "LICENSE-OPC-Foundation"} <= set(files)
+assert not any(f.startswith(("vendor/", "contrib/open62541")) for f in files)
 assert "site/content/client.md" in files
 assert "site/content/services.md" in files
 assert {
@@ -107,7 +102,14 @@ assert {
     "src/pubsub.rs",
     "src/server.rs",
 } <= set(files)
-assert "src/bin/opcua-kit/capture.py" in files
+assert {
+    "src/secure_channel.rs",
+    "src/client/connection.rs",
+    "src/ua/value.rs",
+    "src/ua/generated.rs",
+    "examples/discover.rs",
+} <= set(files)
+assert all(f.endswith(".rs") for f in files if f.startswith("src/"))
 assert "site/content/authoring.md" in files
 assert "site/content/meter.md" in files
 assert "fixtures/meter/readings.ndjson" in files
@@ -120,15 +122,15 @@ with tempfile.TemporaryDirectory() as scratch:
     root = Path(scratch)
     checkout = Path(crate["manifest_path"]).parent
     verify_library_consumer(root, source, crate["rust_version"], "archive")
-    for feature in ("commissioning", "cems"):
+    for feature in ("client", "commissioning", "cems"):
         verify_library_consumer(
             root,
             source,
             crate["rust_version"],
             f"archive-{feature}",
-            offline_feature=feature,
+            profile=feature,
         )
-    # Verify optional roles against the normalized archive and its actual registry backend.
+    # Verify optional roles against the normalized archive and its resolved registry dependencies.
     for feature, example in (("server", "local_server"), ("pubsub", "uadp")):
         cargo(
             "build",
@@ -149,17 +151,41 @@ with tempfile.TemporaryDirectory() as scratch:
         "--features",
         "control",
     )
-    # The normalized registry archive omits the versioned path dependency.
-    wrapper = checkout / "vendor/open62541"
-    if (wrapper / "Cargo.toml").is_file():
-        verify_library_consumer(root, checkout, crate["rust_version"], "checkout")
-        verify_library_consumer(
-            root,
-            source,
-            crate["rust_version"],
-            "archive-patched",
-            wrapper_override=wrapper,
+    # The archive must resolve independently for every role without build-time C tooling.
+    archive = json.loads(
+        cargo(
+            "metadata",
+            "--locked",
+            "--format-version=1",
+            "--all-features",
+            "--manifest-path",
+            str(source / "Cargo.toml"),
         )
+    )
+    assert all(
+        p["source"] and p["source"].startswith("registry+")
+        for p in archive["packages"]
+        if p["name"] != "opcua-kit"
+    )
+    forbidden = {
+        "async-opcua-types",
+        "chrono",
+        "open62541",
+        "open62541-sys",
+        "openssl",
+        "openssl-sys",
+        "aws-lc-sys",
+        "ring",
+        "mbedtls",
+        "mbedtls-sys-auto",
+        "cmake",
+        "bindgen",
+        "signal-hook",
+    }
+    assert not forbidden.intersection(p["name"] for p in archive["packages"])
+    verify_library_consumer(
+        root, checkout, crate["rust_version"], "checkout", profile="client"
+    )
     cargo(
         "install",
         "--locked",
@@ -176,6 +202,7 @@ with tempfile.TemporaryDirectory() as scratch:
         r = subprocess.run(
             [binary, *args],
             cwd=root,
+            env={**os.environ, "PATH": ""},
             input=stdin,
             capture_output=True,
             check=False,
@@ -322,7 +349,44 @@ with tempfile.TemporaryDirectory() as scratch:
         )
 
     invoke(0, "demo", "--scenario", "units", "--export", "visit")
-    # 005-capture-preflight/SR-001 005-capture-preflight/SR-003
+    # 022-native-commissioning/SR-002
+    # Generate short-lived application identities for the installed CLI's offline check.
+    # Only the fixture generator needs openssl. All CLI invocations run with an empty PATH.
+    device_uri = json.loads((root / "visit/contract.json").read_bytes())[
+        "applicationUri"
+    ]
+    for role, uri in (("server", device_uri), ("client", "urn:test:packaged-client")):
+        config = root / f"{role}.cnf"
+        config.write_text(
+            "[req]\nprompt = no\ndistinguished_name = subject\nx509_extensions = profile\n"
+            f"[subject]\nCN = {role}\n[profile]\nsubjectAltName = IP:127.0.0.1,URI:{uri}\n"
+            "basicConstraints = critical,CA:FALSE\n"
+            "keyUsage = critical,digitalSignature,nonRepudiation,keyEncipherment,dataEncipherment\n"
+            f"extendedKeyUsage = {role}Auth\n"
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-config",
+                str(config),
+                "-keyout",
+                f"{role}.key",
+                "-out",
+                f"{role}.crt",
+            ],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
     prepare = (
         "capture",
         "--preflight",
@@ -330,7 +394,12 @@ with tempfile.TemporaryDirectory() as scratch:
         "visit/contract.json",
         "--endpoint",
         "opc.tcp://127.0.0.1:4840",
-        "--insecure-loopback",
+        "--server-cert",
+        "server.crt",
+        "--client-cert",
+        "client.crt",
+        "--client-key",
+        "client.key",
     )
     ready = invoke(0, *prepare)
     assert b"offline" in ready.lower() and b"endpoint" in ready.lower()

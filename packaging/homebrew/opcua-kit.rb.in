@@ -6,10 +6,7 @@ class OpcuaKit < Formula
   sha256 "@SHA256@"
   license any_of: ["MIT", "Apache-2.0"]
 
-  depends_on "cmake" => :build
-  depends_on "python@3.14" => :build
   depends_on "rust" => :build
-  uses_from_macos "llvm" => :build
 
   def install
     system "cargo", "install", *std_cargo_args(features: ["cli", "cems"])

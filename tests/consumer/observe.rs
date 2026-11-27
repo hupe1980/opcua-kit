@@ -132,34 +132,11 @@ async fn observe(
     let data = client
         .read_attributes(&attrs.map(|a| ReadOperand::new(&buffer, a)))
         .await?;
-    assert_eq!(
-        data[0]
-            .value()
-            .unwrap()
-            .as_scalar::<ua::LocalizedText>()
-            .unwrap()
-            .text()
-            .as_str(),
-        Some("Buffer")
-    );
-    assert_eq!(
-        data[1]
-            .value()
-            .unwrap()
-            .as_scalar::<ua::Byte>()
-            .unwrap()
-            .value()
-            & 1,
-        1
-    );
     assert!(
-        !data[2]
-            .value()
-            .unwrap()
-            .as_scalar::<ua::Boolean>()
-            .unwrap()
-            .value()
+        matches!(&data[0].value, Some(ua::Variant::LocalizedText(text)) if text.text.as_ref() == "Buffer")
     );
+    assert!(matches!(data[1].value, Some(ua::Variant::Byte(bits)) if bits & 1 == 1));
+    assert_eq!(data[2].value, Some(ua::Variant::Boolean(false)));
 
     let notifier = NodeId::new("http://opcfoundation.org/UA/", "i=2253")?;
     let interval = Duration::from_millis(50);
@@ -188,30 +165,21 @@ async fn observe(
     println!("TEST events");
     let event = events.next(Duration::from_secs(6)).await?;
     assert_eq!(event.len(), fields.len());
-    assert_eq!(event[0].as_scalar::<ua::UInt16>().unwrap().value(), 702);
-    assert_eq!(
-        event[1]
-            .as_scalar::<ua::LocalizedText>()
-            .unwrap()
-            .text()
-            .as_str(),
-        Some("fan stopped")
-    );
+    assert_eq!(event[0], ua::Variant::UInt16(702));
     assert!(
-        !event[2]
-            .as_scalar::<ua::ByteString>()
-            .unwrap()
-            .as_bytes()
-            .unwrap()
-            .is_empty()
+        matches!(&event[1],ua::Variant::LocalizedText(text) if text.text.as_ref() == "fan stopped")
     );
+    assert!(matches!(&event[2],ua::Variant::ByteString(id) if !id.as_ref().is_empty()));
     assert_eq!(event[3], event[0]);
-    assert!(event[4].is_empty(), "BaseEventType has no ActiveState/Id");
+    assert!(
+        matches!(event[4], ua::Variant::Empty),
+        "BaseEventType has no ActiveState/Id"
+    );
     println!("TEST alarm");
     let alarm = events.next(Duration::from_secs(6)).await?;
     assert_eq!(alarm.len(), fields.len());
-    assert_eq!(alarm[0].as_scalar::<ua::UInt16>().unwrap().value(), 904);
-    assert!(alarm[4].as_scalar::<ua::Boolean>().unwrap().value());
+    assert_eq!(alarm[0], ua::Variant::UInt16(904));
+    assert_eq!(alarm[4], ua::Variant::Boolean(true));
     println!("TEST overflow");
     assert!(matches!(
         events.next(Duration::from_secs(6)).await,

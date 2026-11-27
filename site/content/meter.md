@@ -33,9 +33,11 @@ The shift spans the repeated local hour in Berlin. The first register increase i
 
 ## Read an approved register
 
-Start with the site-approved point list and the meter's data sheet. Verify the physical meter, grid connection point, import direction and the meaning of the meter's source clock. Choose one scalar OPC UA UInt32, UInt64, Float or Double register with declared UN/CEFACT Wh units. Confirm it is cumulative across the quarters you want to compare, and record when it latches and resets. The OPC UA E2 profile gives import and export distinct measurement IDs (1001 and 1004). Both use Float Wh and may aggregate over a resettable measurement period. Source time may mean the last change. Check the device’s measurement period and timestamp convention with the site owner. [OPC Foundation E2 profile](https://reference.opcfoundation.org/specs/OPC-34100/7.1.3.3) · [Measurement periods and resets](https://reference.opcfoundation.org/specs/OPC-34100/6.2.2.1)
+Choose a cumulative grid-import register from the approved point list. It must be a scalar UInt32, UInt64, Float or Double with declared UN/CEFACT Wh units. Check when it latches, when it resets, and what its source timestamp means.
 
-From the driver’s crate directory, run `cargo add opcua-kit --features cems`. Load the contract with `parse_contract` at startup. Open the pinned session with the contract’s `application_uri()` and the approved DER credentials. Reuse the client for each poll. [Open a native session](@/client.md#open-a-session)
+For example, the OPC UA E2 profile assigns different IDs to import (1001) and export (1004), but both use Float Wh. Either may aggregate over a resettable period. Confirm the period and direction against the meter’s data sheet. [E2 measurements](https://reference.opcfoundation.org/specs/OPC-34100/7.1.3.3) · [Periods and resets](https://reference.opcfoundation.org/specs/OPC-34100/6.2.2.1)
+
+From the driver’s crate directory, run `cargo add opcua-kit --features client,cems`. Load the contract with `parse_contract` at startup. Open the pinned session with the contract’s `application_uri()` and the approved DER credentials. Reuse the client for each poll. [Open a client session](@/client.md#open-a-session)
 
 The method returns a typed `MeterReading`. If your driver stores NDJSON for later reconciliation, run `cargo add serde_json@1` and pass the resulting line to its writer.
 
@@ -51,19 +53,20 @@ async fn poll_line(client: &Client, contract: &Contract) -> Result<Vec<u8>, Box<
 }
 ```
 
-The native meter check requires status zero for the target declaration, the unit browse results, and the unit property’s declaration and value. On a metadata error, the native API identifies the failed declaration or unit check and its raw status when available. A proved mismatch calls for reviewing the mapping. An unverified result means the client could not establish a match, for example because the server denied the unit read. Both stop collection before the process value. Once the metadata matches, an unavailable process value can still supply its own status and clocks.
+Check the error when `read_meter` cannot verify the mapping. A mismatch identifies a declaration that differs from the contract. An unverified result means the client lacks evidence, for example when the server denies a unit read. The error names the failed check and preserves its raw status when available. Either outcome stops the operation before the process value is read.
 
-For a field reading, the equivalent native command uses the client application URI from your certificate, a pinned server leaf, and an unencrypted DER client key. The contract supplies the expected server URI and register.
+For a field reading, supply the approved server leaf, client certificate and matching unencrypted private key in PEM or DER. The contract identifies the expected server and register.
 
 ```sh
 opcua-kit meter read --contract grid-import.json --endpoint opc.tcp://meter.example:4840 \
-  --client-uri urn:cems:client --server-cert server.der \
-  --client-cert client.der --client-key client-key.der >> readings.ndjson
+  --server-cert server.der --client-cert client.der --client-key client-key.der >> readings.ndjson
 ```
 
-Named-user native meter reads accept `--username`, `--password-file` and `--security-policy`. Set the reviewed contract principal to `username:<account>`. The native command runs in process. Its `--timeout` sets the collection budget in seconds, including time spent opening the session. Each native service request is limited to at most 60 seconds. Session shutdown follows collection. For a site already using the Python collector with PEM credentials, omit `--client-uri` and use the preparation instructions in the [capture guide](@/capture.md).
+For a named account, set the contract principal to `username:<account>` and supply `--username` and `--password-file`. The CLI uses the client certificate’s application URI. Its collection deadline includes opening the session and reading the register. You can rehearse the same credentials and endpoint offline. [Capture preflight](@/capture.md#check-the-setup-offline)
 
-Each invocation verifies the live type, scalar rank and unit in the session before reading the selected Value. Metadata verification and the Value read are separate services, so a device can still change between them. It writes one JSON line containing the register identity, raw status, available source and server timestamps, and local receipt time. A Good-severity reading retains the payload shown in the table below. A Bad or Uncertain reading carries its status and omits both payload fields. Clocks are preserved to nanoseconds. A timestamp that would require rounding fails the read. If a qualification check or a service request fails, the CLI exits 1 with empty stdout. A successfully observed Bad or Uncertain process status produces a reading and exits 0. The native reader discards any attached payload for those severities. The Python collector uses a restricted decoder for the four supported register formats. The projection later applies its own quality rules. Run one writer per evidence file. These are unsigned measurements, so retain them with the original site records and restrict access.
+Each invocation checks the live type, scalar rank and unit before requesting the register Value. These are separate services, so the device can change between them. A successful read writes one JSON line containing the register identity, raw status, available source and server timestamps, and local receipt time. A Good-severity sample carries the payload shown below. A Bad or Uncertain sample still exits 0 and preserves its status and clocks with no payload. An invalid declaration, failed service or timestamp requiring rounding to nanoseconds exits 1 with empty stdout.
+
+Use one writer per NDJSON file. Retain the original readings with the site records when using them for reconciliation.
 
 ## Choose a register for reconciliation
 
@@ -106,7 +109,7 @@ The projection succeeds and reports two precision exclusions, the fractional int
 
 ## Build a trace as readings arrive
 
-Enable `commissioning` and construct a `MeterWindow` from the **independent close feed’s configuration**. Supply its device, server application URI, register NodeId, start, end and tolerance in Wh. `MeterProjector::new(&contract, window)?` checks that identity against the approved register. The application is responsible for routing the correct close feed to that window.
+Enable `cems` for offline projection or `client,cems` for the live example below. Construct a `MeterWindow` from the **independent close feed’s configuration**. Supply its device, server application URI, register NodeId, start, end and tolerance in Wh. `MeterProjector::new(&contract, window)?` checks that identity against the approved register. The application is responsible for routing the correct close feed to that window.
 
 Keep the projector alongside your polling state. The following function records one observation in an already-open window.
 

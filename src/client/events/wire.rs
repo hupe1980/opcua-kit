@@ -1,155 +1,141 @@
-//! Typed service envelopes for services the high-level SDK does not expose.
-use crate::client::wire::owned;
-use open62541::{DataType, ServiceRequest, ServiceResponse, ua};
-use open62541_sys as sys;
+//! Service request construction and validation shared by subscription clients.
+use crate::client::{ReadSession, ua};
+use crate::{Client, MonitoredNode, NodeId, SubscriptionError};
+use std::{collections::BTreeSet, time::Duration};
 
-macro_rules! service {
-    ($req:ident, $raw_req:ident, $req_ty:ident, $res:ident, $raw_res:ident, $res_ty:ident) => {
-        owned!($req, $raw_req, $req_ty);
-        owned!($res, $raw_res, $res_ty);
-        impl ServiceRequest for $req {
-            type Response = $res;
-            fn request_header(&self) -> &ua::RequestHeader {
-                ua::RequestHeader::raw_ref(&self.0.requestHeader)
-            }
-            fn request_header_mut(&mut self) -> &mut ua::RequestHeader {
-                ua::RequestHeader::raw_mut(&mut self.0.requestHeader)
-            }
-        }
-        impl ServiceResponse for $res {
-            type Request = $req;
-            fn response_header(&self) -> &ua::ResponseHeader {
-                ua::ResponseHeader::raw_ref(&self.0.responseHeader)
-            }
-        }
-    };
+pub(in crate::client) struct Created {
+    pub id: u32,
+    pub interval: Duration,
+    pub timeout_ms: u32,
 }
-service!(
-    CreateSubscription,
-    UA_CreateSubscriptionRequest,
-    UA_TYPES_CREATESUBSCRIPTIONREQUEST,
-    CreatedSubscription,
-    UA_CreateSubscriptionResponse,
-    UA_TYPES_CREATESUBSCRIPTIONRESPONSE
-);
-service!(
-    CreateItems,
-    UA_CreateMonitoredItemsRequest,
-    UA_TYPES_CREATEMONITOREDITEMSREQUEST,
-    CreatedItems,
-    UA_CreateMonitoredItemsResponse,
-    UA_TYPES_CREATEMONITOREDITEMSRESPONSE
-);
-service!(
-    Publish,
-    UA_PublishRequest,
-    UA_TYPES_PUBLISHREQUEST,
-    Published,
-    UA_PublishResponse,
-    UA_TYPES_PUBLISHRESPONSE
-);
-owned!(
-    EventList,
-    UA_EventNotificationList,
-    UA_TYPES_EVENTNOTIFICATIONLIST
-);
-owned!(
-    StatusChange,
-    UA_StatusChangeNotification,
-    UA_TYPES_STATUSCHANGENOTIFICATION
-);
-owned!(
-    FilterResult,
-    UA_EventFilterResult,
-    UA_TYPES_EVENTFILTERRESULT
-);
 
-service!(
-    Republish,
-    UA_RepublishRequest,
-    UA_TYPES_REPUBLISHREQUEST,
-    Republished,
-    UA_RepublishResponse,
-    UA_TYPES_REPUBLISHRESPONSE
-);
-owned!(
-    DataChangeList,
-    UA_DataChangeNotification,
-    UA_TYPES_DATACHANGENOTIFICATION
-);
-pub(super) fn publish(subscription: u32, acks: &[u32], timeout_ms: u32) -> Option<Publish> {
-    let mut req = Publish::init();
-    req.0.requestHeader.timeoutHint = timeout_ms;
-    if !acks.is_empty() {
-        // SAFETY: the request takes ownership of exactly acks.len() initialized SDK records.
-        let p = unsafe {
-            sys::UA_Array_new(
-                acks.len(),
-                &sys::UA_TYPES[sys::UA_TYPES_SUBSCRIPTIONACKNOWLEDGEMENT as usize],
-            )
-        }
-        .cast::<sys::UA_SubscriptionAcknowledgement>();
-        if p.is_null() {
-            return None;
-        }
-        req.0.subscriptionAcknowledgements = p;
-        req.0.subscriptionAcknowledgementsSize = acks.len();
-        for (entry, &sequence) in unsafe { std::slice::from_raw_parts_mut(p, acks.len()) }
-            .iter_mut()
-            .zip(acks)
-        {
-            entry.subscriptionId = subscription;
-            entry.sequenceNumber = sequence;
-        }
+pub(in crate::client) fn publish(
+    acks: Vec<ua::SubscriptionAcknowledgement>,
+    timeout_ms: u32,
+) -> ua::PublishRequest {
+    ua::PublishRequest {
+        request_header: ua::RequestHeader {
+            timeout_hint: timeout_ms,
+            ..Default::default()
+        },
+        subscription_acknowledgements: Some(acks),
     }
-    Some(req)
 }
 
-pub(super) async fn create_subscription(
-    client: &crate::Client,
-    session: &mut crate::client::ReadSession,
-    interval: std::time::Duration,
-) -> Result<(u32, u32), super::EventError> {
-    use crate::SubscriptionError;
-    let mut create = CreateSubscription::init();
-    create.0.requestedPublishingInterval = interval.as_secs_f64() * 1000.;
-    create.0.requestedLifetimeCount = 60;
-    create.0.requestedMaxKeepAliveCount = 5;
-    create.0.maxNotificationsPerPublish = 32;
-    create.0.publishingEnabled = true;
+pub(in crate::client) async fn create_subscription(
+    client: &Client,
+    session: &mut ReadSession,
+    interval: Duration,
+) -> Result<Created, SubscriptionError> {
     let reply = client
-        .guarded(session, client.inner.service_request(create))
-        .await?;
-    let r = &reply.0;
-    let keep_alive_ms = r.revisedPublishingInterval * f64::from(r.revisedMaxKeepAliveCount);
-    if r.subscriptionId == 0
-        || !(0.0..=60_000.).contains(&r.revisedPublishingInterval)
-        || r.revisedPublishingInterval == 0.
-        || !(0.0..=600_000.).contains(&keep_alive_ms)
-        || keep_alive_ms == 0.
-        || r.revisedLifetimeCount < r.revisedMaxKeepAliveCount.saturating_mul(3)
-    {
-        return Err(SubscriptionError::InvalidRevision.into());
-    }
-    Ok((r.subscriptionId, (keep_alive_ms.ceil() as u32) * 2 + 1000))
-}
-pub(super) async fn create_items(
-    client: &crate::Client,
-    session: &mut crate::client::ReadSession,
-    subscription: u32,
-    items: &[ua::MonitoredItemCreateRequest],
-) -> Result<CreatedItems, super::EventError> {
-    let mut request = ua::CreateMonitoredItemsRequest::init().with_items_to_create(items);
-    // SAFETY: this request owns its initialized wrapper and item array.
-    let r = unsafe { request.as_mut() };
-    r.subscriptionId = subscription;
-    r.timestampsToReturn = sys::UA_TimestampsToReturn::UA_TIMESTAMPSTORETURN_BOTH;
-    Ok(client
         .guarded(
             session,
-            client
-                .inner
-                .service_request(CreateItems(request.into_raw())),
+            client.inner.request(ua::CreateSubscriptionRequest {
+                requested_publishing_interval: interval.as_secs_f64() * 1000.,
+                requested_lifetime_count: 60,
+                requested_max_keep_alive_count: 5,
+                max_notifications_per_publish: 32,
+                publishing_enabled: true,
+                ..Default::default()
+            }),
         )
-        .await?)
+        .await?;
+    let keep_alive =
+        reply.revised_publishing_interval * f64::from(reply.revised_max_keep_alive_count);
+    if reply.subscription_id == 0
+        || !(0.0..=60_000.).contains(&reply.revised_publishing_interval)
+        || !(0.0..=600_000.).contains(&keep_alive)
+        || keep_alive == 0.
+        || reply.revised_lifetime_count < reply.revised_max_keep_alive_count.saturating_mul(3)
+    {
+        return Err(SubscriptionError::InvalidRevision);
+    }
+    Ok(Created {
+        id: reply.subscription_id,
+        interval: Duration::from_secs_f64(reply.revised_publishing_interval / 1000.),
+        timeout_ms: (keep_alive.ceil() as u32) * 2 + 1000,
+    })
+}
+
+pub(in crate::client) async fn create_items(
+    client: &Client,
+    session: &mut ReadSession,
+    subscription_id: u32,
+    items: Vec<ua::MonitoredItemCreateRequest>,
+) -> Result<Vec<ua::MonitoredItemCreateResult>, SubscriptionError> {
+    let count = items.len();
+    let response = client
+        .guarded(
+            session,
+            client.inner.request(ua::CreateMonitoredItemsRequest {
+                subscription_id,
+                timestamps_to_return: ua::TimestampsToReturn::Both,
+                items_to_create: Some(items),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    response
+        .results
+        .filter(|r| r.len() == count)
+        .ok_or(SubscriptionError::InvalidRevision)
+}
+
+pub(in crate::client) fn item(
+    node_id: ua::NodeId,
+    attribute_id: u32,
+    client_handle: u32,
+    interval: Duration,
+    filter: ua::ExtensionObject,
+) -> ua::MonitoredItemCreateRequest {
+    ua::MonitoredItemCreateRequest {
+        item_to_monitor: ua::ReadValueId {
+            node_id,
+            attribute_id,
+            ..Default::default()
+        },
+        monitoring_mode: ua::MonitoringMode::Reporting,
+        requested_parameters: ua::MonitoringParameters {
+            client_handle,
+            sampling_interval: interval.as_secs_f64() * 1000.,
+            filter,
+            queue_size: 32,
+            discard_oldest: true,
+        },
+    }
+}
+
+pub(in crate::client) fn revisions(
+    nodes: &[NodeId],
+    results: &[ua::MonitoredItemCreateResult],
+) -> Result<Vec<MonitoredNode>, SubscriptionError> {
+    let mut ids = BTreeSet::new();
+    nodes
+        .iter()
+        .zip(results)
+        .enumerate()
+        .map(|(index, (node, r))| {
+            if !r.status_code.is_good() {
+                return Err(SubscriptionError::ItemRejected {
+                    index,
+                    source: r.status_code,
+                });
+            }
+            let sampling_interval =
+                Duration::try_from_secs_f64(r.revised_sampling_interval / 1000.)
+                    .map_err(|_| SubscriptionError::ItemRevision { index })?;
+            if r.monitored_item_id == 0
+                || !ids.insert(r.monitored_item_id)
+                || sampling_interval > Duration::from_secs(60)
+                || !(2..=32).contains(&r.revised_queue_size)
+            {
+                return Err(SubscriptionError::ItemRevision { index });
+            }
+            Ok(MonitoredNode {
+                node: node.clone(),
+                sampling_interval,
+                queue_size: r.revised_queue_size,
+            })
+        })
+        .collect()
 }

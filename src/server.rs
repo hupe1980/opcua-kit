@@ -1,27 +1,40 @@
-//! Embed an OPC UA address space that serves host-owned read-only variables.
-//! The host owns the address space, the thread running the event loop, and shutdown.
-//! Use an explicitly pinned secure endpoint across hosts, or opt into an anonymous local endpoint.
-mod access;
+//! Serve host-owned scalar variables in an OPC UA address space.
+//! The application owns the event loop, values and shutdown signal.
+mod address;
+mod services;
+mod subscriptions;
+mod transport;
 
-use access::{PinnedReader, ReadOnly};
-use std::{marker::PhantomData, num::NonZeroU16};
-
-pub use open62541::ua;
-use open62541::{Attributes, DataType, Node, ServerBuilder};
-use open62541_sys as sys;
+pub use crate::secure_channel::SecurityPolicy;
+use crate::secure_channel::{Identity, Peer};
+use crate::ua::{DataValue, StatusCode, Variant, VariantType};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    io,
+    marker::PhantomData,
+    net::{SocketAddr, TcpListener},
+    num::NonZeroU16,
+    sync::{Arc, RwLock},
+};
 
 /// Failure to configure, run or update an embedded server.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// Namespace or variable name is empty, oversized, reserved, or contains control characters.
+    /// Invalid namespace URI or variable name.
     #[error("invalid namespace URI or variable name")]
     InvalidName,
-    /// Endpoint, credential or application identity failed local validation.
+    /// Endpoint or credentials failed local validation.
     #[error("{0}")]
     Configuration(&'static str),
-    /// The native server returned an OPC UA error.
+    /// A variable already uses this browse name and NodeId.
+    #[error("variable already exists")]
+    DuplicateVariable,
+    /// OPC UA value or credential validation failed.
+    #[error("{0}")]
+    Protocol(StatusCode),
+    /// Listening socket or connection worker failed.
     #[error(transparent)]
-    Native(#[from] open62541::Error),
+    Io(#[from] io::Error),
 }
 
 /// Host-provisioned server identity, single client pin and explicit bind address.
@@ -41,78 +54,116 @@ pub struct SecureServerConfig<'a> {
     pub trusted_client_certificate_der: &'a [u8],
 }
 
-/// A host-owned address space in one application namespace.
-pub struct Server {
-    server: open62541::Server,
-    namespace: u16,
+const UA_NAMESPACE: &str = "http://opcfoundation.org/UA/";
+const LOCAL_URI: &str = "urn:opcua-kit:server";
+const NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+const TRANSPORT: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
+
+struct Credentials {
+    policy: SecurityPolicy,
+    server: Identity,
+    client: Peer,
+    client_uri: String,
 }
 
-/// Blocking event loop. Move it onto the host's worker thread.
-pub struct ServerRunner(open62541::ServerRunner);
+type Sample = Arc<RwLock<DataValue>>;
+
+struct Host {
+    started: crate::ua::DateTime,
+    namespace: String,
+    application_uri: String,
+    bind: SocketAddr,
+    credentials: Option<Credentials>,
+    variables: RwLock<BTreeMap<String, (u32, Sample)>>,
+}
+
+/// A host-owned address space with one application namespace.
+pub struct Server(Arc<Host>);
+
+/// A blocking server event loop that can run on a host worker thread.
+pub struct ServerRunner(Arc<Host>);
 
 impl ServerRunner {
-    /// Start accepting connections, then run until the callback returns true.
-    /// Startup errors (including an occupied port) are returned here.
+    /// Bind the selected endpoint and serve until the callback returns true.
+    /// All active connections close before this method returns.
     pub fn run_until(self, shutdown: impl FnMut() -> bool) -> Result<(), ServerError> {
-        Ok(self.0.run_until_cancelled(shutdown)?)
+        let socket = TcpListener::bind(self.0.bind)?;
+        transport::run(socket, self.0, shutdown)?;
+        Ok(())
     }
 }
 
-/// Host-side handle to a variable. Only values of its declared type can be set.
+/// Host-side handle to one scalar. Its Rust type fixes the OPC UA value type.
 pub struct Variable<T> {
-    server: open62541::Server,
-    id: ua::NodeId,
+    sample: Sample,
     marker: PhantomData<fn(T)>,
 }
 
-impl<T: DataType> Variable<T> {
-    /// Publish a new scalar from the local application.
+impl<T: Into<Variant> + VariantType> Variable<T> {
+    /// Update the value and its source timestamp atomically.
     pub fn set(&self, value: T) -> Result<(), ServerError> {
-        Ok(self
-            .server
-            .write_value(&self.id, &ua::Variant::scalar(value))?)
+        let sample = scalar(value)?;
+        *self.sample.write().unwrap_or_else(|e| e.into_inner()) = sample;
+        Ok(())
     }
 }
 
+fn scalar<T: Into<Variant> + VariantType>(value: T) -> Result<DataValue, ServerError> {
+    let value = value.into();
+    if value.scalar_type_id() != Some(T::variant_type_id())
+        || matches!(value, Variant::ExtensionObject(_))
+    {
+        return Err(ServerError::Protocol(StatusCode::BadTypeMismatch));
+    }
+    let limits = crate::ua::ContextOwned::default();
+    if crate::ua::BinaryEncodable::encoded_len(&value, &limits.context())
+        .map_err(ServerError::Protocol)?
+        > transport::MESSAGE_LIMIT - 128
+    {
+        return Err(ServerError::Protocol(StatusCode::BadEncodingLimitsExceeded));
+    }
+    Ok(DataValue::new_now(value))
+}
+
 impl Server {
-    /// Configure an anonymous endpoint at `opc.tcp://127.0.0.1:<port>`.
-    /// Variables use string NodeIds in the supplied application namespace.
+    /// Configure anonymous connections on the IPv4 loopback interface.
     pub fn loopback(
         port: NonZeroU16,
         namespace_uri: &str,
     ) -> Result<(Self, ServerRunner), ServerError> {
-        if !valid_name(namespace_uri) || namespace_uri == "http://opcfoundation.org/UA/" {
-            return Err(ServerError::InvalidName);
-        }
-        let url = format!("opc.tcp://127.0.0.1:{port}");
-        let (server, runner) = ServerBuilder::minimal(port.get(), None)
-            .server_urls(&[&url])
-            .access_control(ReadOnly)?
-            .build();
-        Self::address_space(server, runner, namespace_uri)
+        Self::build(
+            ([127, 0, 0, 1], port.get()).into(),
+            LOCAL_URI,
+            namespace_uri,
+            None,
+        )
     }
 
-    /// Bind a Basic256Sha256 / SignAndEncrypt endpoint on one explicitly selected IP.
-    /// The peer presents the trusted client certificate and proves possession of its private key.
-    /// The application session uses an anonymous user token with read-only permissions.
+    /// Configure a Basic256Sha256 SignAndEncrypt endpoint for one pinned reader.
     pub fn secure(
         config: SecureServerConfig<'_>,
         namespace_uri: &str,
     ) -> Result<(Self, ServerRunner), ServerError> {
-        if !valid_name(namespace_uri) || namespace_uri == "http://opcfoundation.org/UA/" {
-            return Err(ServerError::InvalidName);
-        }
+        Self::secure_with_policy(config, namespace_uri, SecurityPolicy::Basic256Sha256)
+    }
+
+    /// Configure one SignAndEncrypt policy for the pinned client and server identities.
+    pub fn secure_with_policy(
+        config: SecureServerConfig<'_>,
+        namespace_uri: &str,
+        policy: SecurityPolicy,
+    ) -> Result<(Self, ServerRunner), ServerError> {
         if !is_unicast(config.bind.ip()) || config.bind.port() == 0 {
             return Err(ServerError::Configuration(
                 "expected a concrete unicast bind IP and nonzero port",
             ));
         }
-        for credential in [
+        for der in [
             config.certificate_der,
             config.private_key_der,
             config.trusted_client_certificate_der,
         ] {
-            if !(1..=65535).contains(&credential.len()) {
+            if !(1..=65535).contains(&der.len()) {
                 return Err(ServerError::Configuration(
                     "credential length must be 1 to 65535 bytes",
                 ));
@@ -132,35 +183,45 @@ impl Server {
             true,
         )
         .map_err(ServerError::Configuration)?;
-        let (server, runner) = ServerBuilder::default_with_secure_security_policies(
-            config.bind.port(),
-            config.certificate_der,
-            config.private_key_der,
-        )?
-        .server_urls(&[&format!("opc.tcp://{}", config.bind)])
-        .access_control(PinnedReader {
-            uri: config.application_uri,
-            der: config.trusted_client_certificate_der,
-        })?
-        .build();
-        Self::address_space(server, runner, namespace_uri)
+        let credentials = Credentials {
+            policy,
+            server: Identity::new(config.certificate_der, config.private_key_der)
+                .map_err(ServerError::Protocol)?,
+            client: Peer::new(config.trusted_client_certificate_der)
+                .map_err(ServerError::Protocol)?,
+            client_uri: config.trusted_client_uri.into(),
+        };
+        Self::build(
+            config.bind,
+            config.application_uri,
+            namespace_uri,
+            Some(credentials),
+        )
     }
 
-    fn address_space(
-        server: open62541::Server,
-        runner: open62541::ServerRunner,
-        namespace_uri: &str,
+    fn build(
+        bind: SocketAddr,
+        uri: &str,
+        namespace: &str,
+        credentials: Option<Credentials>,
     ) -> Result<(Self, ServerRunner), ServerError> {
-        let namespace = server.add_namespace(namespace_uri);
-        if namespace < 2 {
+        if !valid_name(namespace) || namespace == UA_NAMESPACE || namespace == uri {
             return Err(ServerError::InvalidName);
         }
-        Ok((Self { server, namespace }, ServerRunner(runner)))
+        let host = Arc::new(Host {
+            started: crate::ua::DateTime::now(),
+            bind,
+            application_uri: uri.into(),
+            namespace: namespace.into(),
+            credentials,
+            variables: RwLock::default(),
+        });
+        Ok((Self(host.clone()), ServerRunner(host)))
     }
 
-    /// Add a read-only scalar under Objects. Its browse name and string NodeId
-    /// both equal `name`. A duplicate fails without replacing the existing value.
-    pub fn add_variable<T: DataType>(
+    /// Add a typed, read-only scalar under Objects. Its browse name and string
+    /// NodeId both equal `name`. A duplicate leaves the existing value intact.
+    pub fn add_variable<T: Into<Variant> + VariantType>(
         &self,
         name: &str,
         initial: T,
@@ -168,32 +229,14 @@ impl Server {
         if !valid_name(name) {
             return Err(ServerError::InvalidName);
         }
-        // SAFETY: DataType provides the live static UA_DataType descriptor for T.
-        let data_type = unsafe { ua::NodeId::clone_raw(&(*T::data_type()).typeId) };
-        let mut attrs = ua::VariableAttributes::init()
-            .with_display_name(&ua::LocalizedText::new("", name)?)
-            .with_data_type(&data_type)
-            .with_value_rank(-1)
-            .with_access_level(&ua::AccessLevelType::NONE.with_current_read(true));
-        // SAFETY: attrs uniquely owns its initialized UA_VariableAttributes.
-        // Clone into its owned Variant before publishing the complete node.
-        unsafe {
-            let attrs = &mut *attrs.as_mut_ptr();
-            ua::Variant::scalar(initial).clone_into_raw(&mut attrs.value);
-            attrs.specifiedAttributes |= sys::UA_NodeAttributesMask::UA_NODEATTRIBUTESMASK_VALUE.0;
-        }
-        let node = Node::new(
-            ua::NodeId::ns0(sys::UA_NS0ID_OBJECTSFOLDER),
-            ua::NodeId::ns0(sys::UA_NS0ID_ORGANIZES),
-            ua::QualifiedName::new(self.namespace, name),
-            attrs,
-        )
-        .with_type_definition(ua::NodeId::ns0(sys::UA_NS0ID_BASEDATAVARIABLETYPE))
-        .with_requested_new_node_id(ua::NodeId::string(self.namespace, name));
-        let id = self.server.add_node(node)?;
+        let mut variables = self.0.variables.write().unwrap_or_else(|e| e.into_inner());
+        let Entry::Vacant(entry) = variables.entry(name.to_owned()) else {
+            return Err(ServerError::DuplicateVariable);
+        };
+        let sample = Arc::new(RwLock::new(scalar(initial)?));
+        entry.insert((T::variant_type_id() as u32, sample.clone()));
         Ok(Variable {
-            server: self.server.clone(),
-            id,
+            sample,
             marker: PhantomData,
         })
     }
@@ -245,14 +288,11 @@ mod tests {
         }
         let (host, _runner) = Server::loopback(port, "urn:line").unwrap();
         assert!(matches!(
-            host.add_variable("bad\nname", ua::Boolean::new(false)),
+            host.add_variable("bad\nname", false),
             Err(ServerError::InvalidName)
         ));
-        let counter = host.add_variable("Counter", ua::UInt64::new(10)).unwrap();
-        assert!(
-            host.add_variable("Counter", ua::Boolean::new(true))
-                .is_err()
-        );
-        counter.set(ua::UInt64::new(20)).unwrap();
+        let counter = host.add_variable("Counter", 10_u64).unwrap();
+        assert!(host.add_variable("Counter", true).is_err());
+        counter.set(20).unwrap();
     }
 }

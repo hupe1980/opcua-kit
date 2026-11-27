@@ -1,16 +1,20 @@
 {% extends "base.html" %}
 {% block body %}
 {% set root = get_section(path="_index.md") %}
-<div class="wrap library">
-  <header class="doc-intro"><h1>{{ page.title }}</h1>{{ page.content | safe }}</header>
+<header class="docs-band"><div class="wrap docs-header">
+    <div class="doc-intro"><h1>{{ page.title }}</h1>{{ page.content | safe }}</div>
   <div class="finder" hidden><label for="guide-query">Find a guide</label><input id="guide-query" type="search" placeholder="Search by task, service or feature"></div>
+  </div></header>
+<div class="wrap library guide-directory">
+  <nav class="group-links" aria-label="Guide categories">{% for group in config.extra.guide_groups %}<a href="#{{ group | slugify }}">{{ group }}</a>{% endfor %}</nav>
+  <div class="directory-results">
   {% for group in config.extra.guide_groups %}
-  <section class="guide-section"><h2>{{ group }}</h2><div class="guide-grid">
+  <section class="guide-section" id="{{ group | slugify }}"><h2>{{ group }}</h2><div class="guide-grid">
     {% for guide in root.pages %}{% if guide.extra.group and guide.extra.group == group %}
     <a class="guide-card" href="{{ guide.permalink }}" data-topics="{{ guide.extra.keywords }} {% for h in guide.toc %}{{ h.title }} {% for sub in h.children %}{{ sub.title }} {% endfor %}{% endfor %}"><h3>{{ guide.title }}</h3><p>{{ guide.description }}</p></a>
     {% endif %}{% endfor %}
   </div></section>{% endfor %}
-  <p id="results" role="status"></p>
+  <p id="results" role="status"></p></div>
 </div>
 <script defer src="{{ get_url(path='finder.js') }}"></script>
 {% endblock %}

@@ -4,11 +4,13 @@ import asyncio
 import socket
 import sys
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 from asyncua import Server, ua
 from asyncua.common.callback import CallbackType
+from asyncua.common.connection import SecureConnection
 from asyncua.server.user_managers import User, UserRole
 from cryptography.hazmat.primitives.serialization import Encoding
 
@@ -70,9 +72,11 @@ async def peer(directory, endpoint, *, generation, wrong_pin=False):
     reads = []
 
     async def log(event, service):
+        if not event.is_external:
+            return
         reads.append(
             [
-                (r.NodeId.NamespaceIndex, r.NodeId.Identifier)
+                (r.NodeId.NamespaceIndex, r.NodeId.Identifier, r.AttributeId)
                 for r in event.request_params.NodesToRead
             ]
         )
@@ -80,6 +84,27 @@ async def peer(directory, endpoint, *, generation, wrong_pin=False):
     server.subscribe_server_callback(CallbackType.PreRead, log)
     async with server:
         yield users, reads
+
+
+@contextmanager
+def short_tokens():
+    """Force two renewals with no application requests between them."""
+    renewed = asyncio.Event()
+    count = 0
+    original = SecureConnection.open
+
+    def open_channel(connection, params, server):
+        nonlocal count
+        if connection.security_policy.URI.endswith("Aes256_Sha256_RsaPss"):
+            params.RequestedLifetime = 4000
+            if params.RequestType == ua.SecurityTokenRequestType.Renew:
+                count += 1
+                if count == 2:
+                    renewed.set()
+        return original(connection, params, server)
+
+    with patch.object(SecureConnection, "open", open_channel):
+        yield renewed
 
 
 async def marker(child, expected):
@@ -96,10 +121,10 @@ async def command(child, text):
 
 
 def check_reads(reads, namespace, expected_lengths):
-    targets = [ops for ops in reads if any(node == "Counter" for _, node in ops)]
+    targets = [ops for ops in reads if any(node == "Counter" for _, node, _ in ops)]
     assert [len(ops) for ops in targets] == expected_lengths, targets
-    assert all(index == namespace for ops in targets for index, _ in ops), targets
-    read_ids = [node for ops in reads for index, node in ops if index == 0]
+    assert all(index == namespace for ops in targets for index, _, _ in ops), targets
+    read_ids = [node for ops in reads for index, node, _ in ops if index == 0]
     assert all(node in read_ids for node in [2254, 2255, 11705]), read_ids
 
 
@@ -119,16 +144,26 @@ async def run(binary):
         child = None
         try:
             async with peer(directory, endpoint, generation=1) as (users, reads):
-                child = await asyncio.create_subprocess_exec(
-                    binary,
-                    endpoint,
-                    directory,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                )
-                await marker(child, "initial")
-                assert users.logins == 1
-                check_reads(reads, 2, [2])
+                with short_tokens() as renewed:
+                    child = await asyncio.create_subprocess_exec(
+                        binary,
+                        endpoint,
+                        directory,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                    )
+                    await marker(child, "ready")
+                    idle_start = len(reads)
+                    await asyncio.wait_for(renewed.wait(), 30)
+                    probes = reads[idle_start:]
+                    assert probes and all(
+                        ops == [(0, ua.ObjectIds.Server, ua.AttributeIds.NodeClass)]
+                        for ops in probes
+                    ), probes
+                    await command(child, "renewed")
+                    await marker(child, "initial")
+                    assert users.logins == 1
+                    check_reads(reads, 2, [2, 1])
             await command(child, "disconnected")
             await marker(child, "gap")
             async with peer(directory, endpoint, generation=2, wrong_pin=True) as (
@@ -138,7 +173,7 @@ async def run(binary):
                 await command(child, "wrong-pin")
                 await marker(child, "rejected")
                 assert users.logins == 0
-                assert all(node != "Counter" for ops in reads for _, node in ops)
+                assert all(node != "Counter" for ops in reads for _, node, _ in ops)
             async with peer(directory, endpoint, generation=2) as (users, reads):
                 await command(child, "restarted")
                 await marker(child, "recovered")

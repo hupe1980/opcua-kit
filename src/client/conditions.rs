@@ -1,7 +1,6 @@
 //! Standard OPC UA Part 9 methods for a retained state or a specific condition event.
 use super::{CallOutcome, Control, ControlError, Events, ua};
 use crate::NodeId;
-use open62541::DataType;
 
 const UA: &str = "http://opcfoundation.org/UA/";
 
@@ -100,17 +99,19 @@ impl Control<'_> {
         }
         let text = match comment {
             Some(c) => {
-                if c.locale.len().saturating_add(c.text.len()) > 16 * 1024 {
+                if c.locale.len().saturating_add(c.text.len()) > 16 * 1024
+                    || c.locale.contains('\0')
+                    || c.text.contains('\0')
+                {
                     return Err(ConditionError::InvalidComment);
                 }
                 ua::LocalizedText::new(c.locale, c.text)
-                    .map_err(|_| ConditionError::InvalidComment)?
             }
-            None => ua::LocalizedText::init(),
+            None => ua::LocalizedText::default(),
         };
         let arguments = [
-            ua::Variant::scalar(ua::ByteString::new(event_id)),
-            ua::Variant::scalar(text),
+            ua::Variant::ByteString(ua::ByteString::from(event_id.to_vec())),
+            ua::Variant::LocalizedText(Box::new(text)),
         ];
         Ok(self
             .call_method(condition, &standard(method), &arguments)
@@ -125,7 +126,7 @@ impl Events {
     /// retained notifications through [`Events::next`] to complete a refresh.
     pub async fn refresh_conditions(&mut self) -> Result<CallOutcome, ConditionError> {
         let (client, subscription) = self.condition_session().ok_or(ConditionError::Ended)?;
-        let args = [ua::Variant::scalar(ua::UInt32::new(subscription))];
+        let args = [ua::Variant::UInt32(subscription)];
         Ok(Control::new(client)
             .call_method(&standard("i=2782"), &standard("i=3875"), &args)
             .await?)

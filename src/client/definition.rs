@@ -1,82 +1,10 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
-use uuid::Uuid;
 
 use super::sample::Quality;
 use super::{Client, DataValue, Namespaces, ReadError, ReadMetadata, ReadSession, Sample, ua};
 use crate::NodeId;
 
-/// A standard node attribute selectable through the OPC UA Read service.
-/// Nodes that do not support a selected attribute return its per-operand status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ReadAttribute {
-    NodeId,
-    NodeClass,
-    BrowseName,
-    DisplayName,
-    Description,
-    WriteMask,
-    UserWriteMask,
-    IsAbstract,
-    Symmetric,
-    InverseName,
-    ContainsNoLoops,
-    EventNotifier,
-    ArrayDimensions,
-    AccessLevel,
-    UserAccessLevel,
-    MinimumSamplingInterval,
-    Historizing,
-    Executable,
-    UserExecutable,
-    DataTypeDefinition,
-    RolePermissions,
-    UserRolePermissions,
-    AccessRestrictions,
-    AccessLevelEx,
-
-    /// The process value.
-    Value,
-    /// The declared DataType node.
-    DataType,
-    /// The declared dimensionality, such as -1 for a scalar.
-    ValueRank,
-}
-
-impl ReadAttribute {
-    pub(super) fn wire(self) -> ua::AttributeId {
-        match self {
-            Self::NodeId => ua::AttributeId::NODEID,
-            Self::NodeClass => ua::AttributeId::NODECLASS,
-            Self::BrowseName => ua::AttributeId::BROWSENAME,
-            Self::DisplayName => ua::AttributeId::DISPLAYNAME,
-            Self::Description => ua::AttributeId::DESCRIPTION,
-            Self::WriteMask => ua::AttributeId::WRITEMASK,
-            Self::UserWriteMask => ua::AttributeId::USERWRITEMASK,
-            Self::IsAbstract => ua::AttributeId::ISABSTRACT,
-            Self::Symmetric => ua::AttributeId::SYMMETRIC,
-            Self::InverseName => ua::AttributeId::INVERSENAME,
-            Self::ContainsNoLoops => ua::AttributeId::CONTAINSNOLOOPS,
-            Self::EventNotifier => ua::AttributeId::EVENTNOTIFIER,
-            Self::ArrayDimensions => ua::AttributeId::ARRAYDIMENSIONS,
-            Self::AccessLevel => ua::AttributeId::ACCESSLEVEL,
-            Self::UserAccessLevel => ua::AttributeId::USERACCESSLEVEL,
-            Self::MinimumSamplingInterval => ua::AttributeId::MINIMUMSAMPLINGINTERVAL,
-            Self::Historizing => ua::AttributeId::HISTORIZING,
-            Self::Executable => ua::AttributeId::EXECUTABLE,
-            Self::UserExecutable => ua::AttributeId::USEREXECUTABLE,
-            Self::DataTypeDefinition => ua::AttributeId::DATATYPEDEFINITION,
-            Self::RolePermissions => ua::AttributeId::ROLEPERMISSIONS,
-            Self::UserRolePermissions => ua::AttributeId::USERROLEPERMISSIONS,
-            Self::AccessRestrictions => ua::AttributeId::ACCESSRESTRICTIONS,
-            Self::AccessLevelEx => ua::AttributeId::ACCESSLEVELEX,
-
-            Self::Value => ua::AttributeId::VALUE,
-            Self::DataType => ua::AttributeId::DATATYPE,
-            Self::ValueRank => ua::AttributeId::VALUERANK,
-        }
-    }
-}
+pub use crate::ua::AttributeId as ReadAttribute;
 
 /// A URI-qualified node and the attribute to read from it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,32 +39,31 @@ impl Namespaces {
     pub(super) fn stable_node(&self, wire: &ua::NodeId) -> Result<NodeId, ReadError> {
         let namespace = self
             .by_index
-            .get(usize::from(wire.namespace_index()))
+            .get(usize::from(wire.namespace))
             .ok_or(ReadError::InvalidDataType)?;
         Self::node_in(namespace, wire)
     }
 
     pub(super) fn node_in(namespace: &str, wire: &ua::NodeId) -> Result<NodeId, ReadError> {
-        let id = if let Some((_, n)) = wire.as_numeric() {
-            format!("i={n}")
-        } else if let Some((_, text)) = wire.as_string() {
-            // Four UTF-8 bytes per character bounds the copy before NodeId::new checks the text.
-            let text = text
-                .as_str()
-                .filter(|text| text.len() <= 4 * 4096)
-                .ok_or(ReadError::InvalidDataType)?;
-            format!("s={text}")
-        } else if let Some((_, guid)) = wire.as_guid() {
-            let uuid = Uuid::from_fields(guid.data1(), guid.data2(), guid.data3(), &guid.data4());
-            format!("g={uuid}")
-        } else if let Some((_, bytes)) = wire.as_byte_string() {
-            let bytes = bytes
-                .as_bytes()
-                .filter(|bytes| bytes.len() <= 4096)
-                .ok_or(ReadError::InvalidDataType)?;
-            format!("b={}", STANDARD.encode(bytes))
-        } else {
-            return Err(ReadError::InvalidDataType);
+        let id = match &wire.identifier {
+            ua::Identifier::Numeric(n) => format!("i={n}"),
+            ua::Identifier::String(text) => {
+                let text = text
+                    .value()
+                    .as_deref()
+                    .filter(|text| text.len() <= 4 * 4096)
+                    .ok_or(ReadError::InvalidDataType)?;
+                format!("s={text}")
+            }
+            ua::Identifier::Guid(id) => format!("g={id}"),
+            ua::Identifier::ByteString(bytes) => {
+                let data = bytes
+                    .value
+                    .as_deref()
+                    .filter(|bytes| bytes.len() <= 4096)
+                    .ok_or(ReadError::InvalidDataType)?;
+                format!("b={}", STANDARD.encode(data))
+            }
         };
         NodeId::new(namespace, id).map_err(|_| ReadError::InvalidDataType)
     }
@@ -144,13 +71,13 @@ impl Namespaces {
 
 pub(super) fn decode_data_type(
     namespaces: &Namespaces,
-    raw: &DataValue<ua::Variant>,
+    raw: &DataValue,
     quality: Quality,
 ) -> Result<Sample<NodeId>, ReadError> {
     Sample::decode_with(raw, quality, |v| {
-        let wire = v
-            .as_scalar::<ua::NodeId>()
-            .ok_or(ReadError::ScalarTypeMismatch { expected: "NodeId" })?;
+        let ua::Variant::NodeId(wire) = v else {
+            return Err(ReadError::ScalarTypeMismatch { expected: "NodeId" });
+        };
         namespaces.stable_node(wire).map(Some)
     })
 }
@@ -158,8 +85,8 @@ pub(super) fn decode_data_type(
 impl VariableDefinition {
     fn decode(
         namespaces: &Namespaces,
-        data_type: &DataValue<ua::Variant>,
-        value_rank: &DataValue<ua::Variant>,
+        data_type: &DataValue,
+        value_rank: &DataValue,
         quality: Quality,
     ) -> Self {
         let data_type = decode_data_type(namespaces, data_type, quality);
@@ -184,7 +111,7 @@ impl Client {
     pub async fn read_attributes(
         &self,
         operands: &[ReadOperand<'_>],
-    ) -> Result<Vec<DataValue<ua::Variant>>, ReadError> {
+    ) -> Result<Vec<DataValue>, ReadError> {
         self.read_batch(operands.iter().copied(), std::convert::identity)
             .await
     }
@@ -242,7 +169,6 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use open62541::DataType;
 
     fn namespaces() -> Namespaces {
         let entries = [
@@ -250,7 +176,7 @@ mod tests {
             "urn:site:signals",
             "urn:site:datatypes",
         ]
-        .map(|s| ua::String::new(s).unwrap());
+        .map(|s| ua::Variant::String(s.into()));
         crate::client::namespace_map(&entries).unwrap()
     }
 
@@ -258,30 +184,35 @@ mod tests {
     fn declared_node_ids_use_the_session_uri_and_preserve_all_four_identifier_forms() {
         let ns = namespaces();
         for (wire, expected) in [
-            (ua::NodeId::numeric(2, u32::MAX), "i=4294967295"),
+            (ua::NodeId::new(2, u32::MAX), "i=4294967295"),
             (
-                ua::NodeId::string(2, "Rate;ns=3;温度%2F"),
+                ua::NodeId::new(2, "Rate;ns=3;温度%2F"),
                 "s=Rate;ns=3;温度%2F",
             ),
             (
-                ua::NodeId::guid(
+                ua::NodeId::new(
                     2,
-                    ua::Guid::new(0x12345678, 0x90ab, 0xcdef, [1, 2, 3, 4, 5, 6, 7, 8]),
+                    "12345678-90ab-cdef-0102-030405060708"
+                        .parse::<ua::Guid>()
+                        .unwrap(),
                 ),
                 "g=12345678-90ab-cdef-0102-030405060708",
             ),
-            (ua::NodeId::byte_string(2, &[0xfb, 0xff, 0]), "b=+/8A"),
+            (
+                ua::NodeId::new(2, ua::ByteString::from(vec![0xfb, 0xff, 0])),
+                "b=+/8A",
+            ),
         ] {
             let stable = ns.stable_node(&wire).unwrap();
             assert_eq!(stable.namespace(), "urn:site:datatypes");
             assert_eq!(stable.identifier(), expected);
         }
         for invalid in [
-            ua::NodeId::ns0(0),
-            ua::NodeId::numeric(3, 1),
-            ua::NodeId::string(2, "x\ny"),
-            ua::NodeId::string(2, &"x".repeat(4097)),
-            ua::NodeId::byte_string(2, &[1; 4097]),
+            ua::NodeId::from(0u32),
+            ua::NodeId::new(3, 1u32),
+            ua::NodeId::new(2, "x\ny"),
+            ua::NodeId::new(2, "x".repeat(4097)),
+            ua::NodeId::new(2, ua::ByteString::from(vec![1; 4097])),
         ] {
             assert!(matches!(
                 ns.stable_node(&invalid),
@@ -293,31 +224,32 @@ mod tests {
     #[test]
     fn definition_preserves_independent_status_clocks_and_malformed_results() {
         let ns = namespaces();
-        let at = ua::DateTime::try_from_unix_timestamp_nanos(100).unwrap();
-        let data = ua::DataValue::new(ua::Variant::scalar(ua::NodeId::ns0(9)))
-            .with_source_timestamp(&at)
-            .with_source_picoseconds(5)
-            .with_status(&ua::StatusCode::GOODCLAMPED)
-            .cast();
-        let rank = ua::DataValue::new(ua::Variant::scalar(ua::Int32::new(-3))).cast();
+        let at = ua::DateTime::from_unix_timestamp_nanos(100).unwrap();
+        let data = ua::DataValue {
+            source_timestamp: Some(at),
+            source_picoseconds: Some(5),
+            status: Some(ua::StatusCode::GoodClamped),
+            ..ua::DataValue::value_only(ua::Variant::from(ua::NodeId::from(9u32)))
+        };
+        let rank = ua::DataValue::value_only(ua::Variant::Int32(-3));
         let valid = VariableDefinition::decode(&ns, &data, &rank, Quality::GoodSeverity);
         let ty = valid.data_type.unwrap();
         assert_eq!(
             ty.value.unwrap().namespace(),
             "http://opcfoundation.org/UA/"
         );
-        assert_eq!(ty.status, ua::StatusCode::GOODCLAMPED.into_raw());
+        assert_eq!(ty.status, ua::StatusCode::GoodClamped.bits());
         assert_eq!(ty.source_timestamp.unwrap().ten_picoseconds, Some(5));
         assert_eq!(valid.value_rank.unwrap().value, Some(-3));
 
-        let wrong_type = ua::DataValue::new(ua::Variant::scalar(ua::Int32::new(9))).cast();
+        let wrong_type = ua::DataValue::value_only(ua::Variant::Int32(9));
         let partial = VariableDefinition::decode(&ns, &wrong_type, &rank, Quality::GoodSeverity);
         assert!(matches!(
             partial.data_type,
             Err(ReadError::ScalarTypeMismatch { expected: "NodeId" })
         ));
         assert_eq!(partial.value_rank.unwrap().value, Some(-3));
-        let invalid_rank = ua::DataValue::new(ua::Variant::scalar(ua::Int32::new(-4))).cast();
+        let invalid_rank = ua::DataValue::value_only(ua::Variant::Int32(-4));
         let partial = VariableDefinition::decode(&ns, &data, &invalid_rank, Quality::GoodSeverity);
         assert_eq!(
             partial.data_type.unwrap().value.unwrap().identifier(),
@@ -327,19 +259,16 @@ mod tests {
             partial.value_rank,
             Err(ReadError::InvalidValueRank)
         ));
-        let bad = ua::DataValue::init()
-            .with_status(&ua::StatusCode::BADATTRIBUTEIDINVALID)
-            .cast();
-        let missing = VariableDefinition::decode(
-            &ns,
-            &bad,
-            &ua::DataValue::init().cast(),
-            Quality::GoodSeverity,
-        );
+        let bad = ua::DataValue {
+            status: Some(ua::StatusCode::BadAttributeIdInvalid),
+            ..ua::DataValue::default()
+        };
+        let missing =
+            VariableDefinition::decode(&ns, &bad, &ua::DataValue::default(), Quality::GoodSeverity);
         let missing_type = missing.data_type.unwrap();
         assert_eq!(
             missing_type.status,
-            ua::StatusCode::BADATTRIBUTEIDINVALID.into_raw()
+            ua::StatusCode::BadAttributeIdInvalid.bits()
         );
         assert!(missing_type.value.is_none());
         assert!(missing.value_rank.unwrap().value.is_none());
@@ -348,12 +277,9 @@ mod tests {
     #[test]
     fn rank_accepts_all_standard_categories_and_rejects_arrays_and_unsigned_integers() {
         let ns = namespaces();
-        let type_array = ua::DataValue::new(ua::Variant::array(ua::Array::from_slice(&[
-            ua::NodeId::ns0(9),
-        ])))
-        .cast();
+        let type_array = ua::DataValue::value_only(ua::Variant::from(vec![ua::NodeId::from(9u32)]));
         for n in [-3, -2, -1, 0, 1, 2, i32::MAX] {
-            let raw = ua::DataValue::new(ua::Variant::scalar(ua::Int32::new(n))).cast();
+            let raw = ua::DataValue::value_only(ua::Variant::Int32(n));
             let result = VariableDefinition::decode(&ns, &type_array, &raw, Quality::GoodSeverity);
             assert!(matches!(
                 result.data_type,
@@ -361,14 +287,11 @@ mod tests {
             ));
             assert_eq!(result.value_rank.unwrap().value, Some(n));
         }
-        for wrong in [
-            ua::Variant::scalar(ua::UInt32::new(1)),
-            ua::Variant::array(ua::Array::from_slice(&[ua::Int32::new(-1)])),
-        ] {
+        for wrong in [ua::Variant::UInt32(1), ua::Variant::from(vec![-1i32])] {
             let result = VariableDefinition::decode(
                 &ns,
                 &type_array,
-                &ua::DataValue::new(wrong).cast(),
+                &ua::DataValue::value_only(wrong),
                 Quality::GoodSeverity,
             );
             assert!(matches!(

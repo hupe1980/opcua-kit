@@ -1,10 +1,10 @@
 //! Typed fixed-width OPC UA arrays and matrices.
+use super::ua;
 use super::{
     Client, ReadError, Sample,
     sample::{FixedScalar, Quality},
 };
 use crate::NodeId;
-use open62541::{DataType, ua};
 
 /// Values in OPC UA row-major order. A missing dimensions field on the wire is
 /// represented by one dimension equal to the number of elements.
@@ -17,20 +17,24 @@ pub struct ArrayValue<T> {
 }
 
 fn decode<T: FixedScalar>(value: &ua::Variant) -> Result<Option<ArrayValue<T>>, ReadError> {
-    // SAFETY: the SDK owns the decoded Variant and arrays throughout this borrow.
-    let raw = unsafe { value.as_ref() };
-    if value.is_scalar() || raw.type_ != T::Wire::data_type() {
+    if let ua::Variant::NullArray(kind) = value {
+        return if *kind == T::TYPE {
+            Ok(None)
+        } else {
+            Err(ReadError::ArrayTypeMismatch)
+        };
+    }
+    let ua::Variant::Array(array) = value else {
+        return Err(ReadError::ArrayTypeMismatch);
+    };
+    if array.value_type != T::TYPE {
         return Err(ReadError::ArrayTypeMismatch);
     }
-    // A null array and an empty array are distinct OPC UA values.
-    if raw.arrayLength == 0 && raw.data.is_null() && raw.arrayDimensionsSize == 0 {
-        return Ok(None);
+    let elements = &array.values;
+    let dims = array.dimensions.as_deref().unwrap_or_default();
+    if elements.len() > 65536 || dims.len() > 16 {
+        return Err(ReadError::InvalidArray);
     }
-    let elements =
-        unsafe { super::wire::slice(raw.data.cast::<T::Wire>(), raw.arrayLength, 65536) }
-            .ok_or(ReadError::InvalidArray)?;
-    let dims = unsafe { super::wire::slice(raw.arrayDimensions, raw.arrayDimensionsSize, 16) }
-        .ok_or(ReadError::InvalidArray)?;
     if !dims.is_empty()
         && dims
             .iter()
@@ -45,13 +49,16 @@ fn decode<T: FixedScalar>(value: &ua::Variant) -> Result<Option<ArrayValue<T>>, 
         } else {
             dims.to_vec()
         },
-        values: elements.iter().map(T::element).collect(),
+        values: elements
+            .iter()
+            .map(|v| T::decode(v)?.ok_or(ReadError::ArrayTypeMismatch))
+            .collect::<Result<_, _>>()?,
     }))
 }
 
 impl Client {
     /// Read a numeric or Boolean array, preserving status, both clocks, and matrix dimensions.
-    /// Accepts at most 65,536 elements and 16 dimensions after SDK response decoding.
+    /// Accepts at most 65,536 elements and 16 dimensions after response decoding.
     pub async fn read_array<T: FixedScalar>(
         &self,
         node: &NodeId,
@@ -68,26 +75,25 @@ impl Client {
     ) -> Result<Sample<ArrayValue<T>>, ReadError> {
         let range = range_text(ranges)?;
         let (mut session, metadata) = self.read_session().await?;
-        let mut operand = ua::ReadValueId::init()
-            .with_node_id(&metadata.namespaces.wire_node(node, 0)?)
-            .with_attribute_id(&ua::AttributeId::VALUE);
-        // SAFETY: operand owns the UA string until the request takes a deep copy.
-        ua::String::new(&range)
-            .expect("numeric range is ASCII")
-            .move_into_raw(&mut unsafe { operand.as_mut() }.indexRange);
-        let req = ua::ReadRequest::init()
-            .with_timestamps_to_return(&ua::TimestampsToReturn::BOTH)
-            .with_nodes_to_read(&[operand]);
+        let operand = ua::ReadValueId {
+            node_id: metadata.namespaces.wire_node(node, 0)?,
+            attribute_id: ua::AttributeId::Value as u32,
+            index_range: range.into(),
+            ..Default::default()
+        };
+        let request = ua::ReadRequest {
+            timestamps_to_return: ua::TimestampsToReturn::Both,
+            nodes_to_read: Some(vec![operand]),
+            ..Default::default()
+        };
         let response = self
-            .guarded(&mut session, self.inner.service_request(req))
+            .guarded(&mut session, self.inner.request(request))
             .await?;
-        let raw = unsafe { response.as_ref() };
-        let [v] = unsafe { super::wire::slice(raw.results, raw.resultsSize, 1) }
-            .ok_or(ReadError::InvalidServerMetadata)?
-        else {
+        let Some([value]) = response.results.as_deref() else {
+            session.interrupted = true;
             return Err(ReadError::InvalidServerMetadata);
         };
-        let sample = super::sample::decode_borrowed(ua::DataValue::raw_ref(v), decode::<T>)?;
+        let sample = super::sample::decode_borrowed(value, decode::<T>)?;
         if let Some(a) = &sample.value
             && (a.dimensions.len() != ranges.len()
                 || a.dimensions.iter().zip(ranges).any(|(&size, r)| {
@@ -139,32 +145,18 @@ mod tests {
     }
     #[test]
     fn array_decoder_checks_type_before_copy_and_preserves_dimensions() {
-        let mut v = ua::Variant::array(ua::Array::from_slice(&[
-            ua::UInt32::new(12),
-            ua::UInt32::new(45),
-        ]));
-        assert!(decode::<i32>(&v).is_err());
-        assert_eq!(decode::<u32>(&v).unwrap().unwrap().dimensions, [2]);
-        // SAFETY: assign temporary, live borrowed dimensions; restore before dropping the owner.
-        let mut dims = [1, 2];
-        unsafe {
-            let r = v.as_mut();
-            r.arrayDimensionsSize = 2;
-            r.arrayDimensions = dims.as_mut_ptr();
-        }
-        let matrix = decode::<u32>(&v);
-        unsafe {
-            *v.as_mut().arrayDimensions = 2;
-        }
-        let invalid = decode::<u32>(&v);
-        unsafe {
-            let r = v.as_mut();
-            r.arrayDimensionsSize = 0;
-            r.arrayDimensions = std::ptr::null_mut();
-        }
-        assert_eq!(matrix.unwrap().unwrap().dimensions, [1, 2]);
-        assert!(invalid.is_err());
-        let empty = ua::Variant::array(ua::Array::<ua::UInt16>::new(0));
-        assert!(decode::<u32>(&empty).is_err());
+        let make = |dimensions| {
+            ua::Variant::Array(Box::new(ua::Array {
+                value_type: ua::VariantScalarTypeId::UInt32,
+                values: vec![12u32.into(), 45u32.into()],
+                dimensions,
+            }))
+        };
+        assert!(decode::<i32>(&make(None)).is_err());
+        assert_eq!(decode::<u32>(&make(None)).unwrap().unwrap().dimensions, [2]);
+        let matrix = decode::<u32>(&make(Some(vec![1, 2]))).unwrap().unwrap();
+        assert_eq!(matrix.dimensions, [1, 2]);
+        assert_eq!(matrix.values, [12, 45]);
+        assert!(decode::<u32>(&make(Some(vec![2, 2]))).is_err());
     }
 }

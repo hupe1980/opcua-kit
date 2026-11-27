@@ -1,5 +1,4 @@
 //! Explicit control capability for an authenticated session. The server enforces permissions.
-use open62541::{DataType, ServiceRequest};
 
 use super::{Client, ReadError, ReadSession, Scalar, ua, wire};
 use crate::{NodeId, Severity, status_severity};
@@ -20,9 +19,6 @@ pub enum ControlError {
     /// The timestamp has no exact, non-sentinel OPC UA DateTime representation.
     #[error("timestamp must be representable as a non-sentinel 100 ns OPC UA DateTime")]
     InvalidDateTime,
-    /// The native backend cannot encode a Rust string containing a NUL byte.
-    #[error("cannot encode a string containing NUL")]
-    InvalidString,
     /// A usable reply could not be obtained after entering dispatch. The operation may have executed.
     #[error("control outcome is unknown after dispatch: {0}")]
     Indeterminate(#[source] ReadError),
@@ -91,18 +87,23 @@ impl<'a> Control<'a> {
             .namespaces
             .wire_node(node, 0)
             .map_err(ControlError::Preflight)?;
-        let request = ua::WriteRequest::init().with_nodes_to_write(&[ua::WriteValue::init()
-            .with_node_id(&node)
-            .with_attribute_id(&ua::AttributeId::VALUE)
-            .with_value(&ua::DataValue::new(value.clone()))]);
-        self.dispatch(&mut session, request, |reply| {
-            // SAFETY: the SDK owns the decoded response throughout this borrow.
-            let reply = unsafe { reply.as_ref() };
-            let [status] = (unsafe { wire::slice(reply.results, reply.resultsSize, 1) })? else {
-                return None;
-            };
-            Some(*status)
-        })
+        let request = ua::WriteRequest {
+            nodes_to_write: Some(vec![ua::WriteValue {
+                node_id: node,
+                attribute_id: ua::AttributeId::Value as u32,
+                value: ua::DataValue::value_only(value.clone()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        self.dispatch(
+            &mut session,
+            self.0.inner.request(request),
+            |reply| match reply.results.as_deref() {
+                Some([status]) => Some(status.bits()),
+                _ => None,
+            },
+        )
         .await
     }
 
@@ -141,31 +142,31 @@ impl<'a> Control<'a> {
             .namespaces
             .wire_node(method, 1)
             .map_err(ControlError::Preflight)?;
-        let request =
-            ua::CallRequest::init().with_methods_to_call(&[ua::CallMethodRequest::init()
-                .with_object_id(&object)
-                .with_method_id(&method)
-                .with_input_arguments(inputs)]);
-        self.dispatch(&mut session, request, |reply| {
+        let request = ua::CallRequest {
+            methods_to_call: Some(vec![ua::CallMethodRequest {
+                object_id: object,
+                method_id: method,
+                input_arguments: Some(inputs.to_vec()),
+            }]),
+            ..Default::default()
+        };
+        self.dispatch(&mut session, self.0.inner.request(request), |reply| {
             call_outcome(reply, inputs.len())
         })
         .await
     }
 
-    async fn dispatch<R: ServiceRequest, T>(
+    async fn dispatch<R, T>(
         &self,
         session: &mut ReadSession,
-        request: R,
-        decode: impl FnOnce(&R::Response) -> Option<T>,
+        request: impl Future<Output = Result<R, ua::StatusCode>>,
+        decode: impl FnOnce(&R) -> Option<T>,
     ) -> Result<T, ControlError> {
         self.0.check_channel().map_err(ControlError::Preflight)?;
         // Keep the session retired if this future is cancelled, if dispatch fails, or if
         // the reply cannot be tied to exactly one operation on the original channel.
         session.interrupted = true;
-        let response = self
-            .0
-            .inner
-            .service_request(request)
+        let response = request
             .await
             .map_err(|e| ControlError::Indeterminate(ReadError::Service(e)))?;
         self.0
@@ -189,32 +190,22 @@ fn check_values<'a>(values: impl ExactSizeIterator<Item = &'a ua::Variant>) -> O
 }
 
 fn call_outcome(reply: &ua::CallResponse, inputs: usize) -> Option<CallOutcome> {
-    // SAFETY: all decoded arrays are SDK-owned and borrowed only while the response lives.
-    let reply = unsafe { reply.as_ref() };
-    let [result] = (unsafe { wire::slice(reply.results, reply.resultsSize, 1) })? else {
+    let [result] = reply.results.as_deref()? else {
         return None;
     };
-    let statuses = unsafe {
-        wire::slice(
-            result.inputArgumentResults,
-            result.inputArgumentResultsSize,
-            inputs,
-        )
-    }?;
+    let statuses = result.input_argument_results.as_deref().unwrap_or_default();
     if !statuses.is_empty() && statuses.len() != inputs {
         return None;
     }
-    let outputs =
-        unsafe { wire::slice(result.outputArguments, result.outputArgumentsSize, MAX_ARGS) }?;
-    if status_severity(result.statusCode) == Severity::Bad && !outputs.is_empty() {
+    let outputs = result.output_arguments.as_deref().unwrap_or_default();
+    if status_severity(result.status_code.bits()) == Severity::Bad && !outputs.is_empty() {
         return None;
     }
-    let values = outputs.iter().map(ua::Variant::raw_ref);
-    check_values(values.clone())?;
+    check_values(outputs.iter())?;
     Some(CallOutcome {
-        status: result.statusCode,
-        input_statuses: statuses.to_vec(),
-        outputs: values.cloned().collect(),
+        status: result.status_code.bits(),
+        input_statuses: statuses.iter().map(|s| s.bits()).collect(),
+        outputs: outputs.to_vec(),
     })
 }
 
@@ -224,7 +215,7 @@ mod tests {
 
     #[test]
     fn variant_budgets_count_all_encoded_arguments() {
-        let bytes = |n| ua::Variant::scalar(ua::ByteString::new(&vec![0; n]));
+        let bytes = |n| ua::Variant::ByteString(vec![0; n].into());
         let at_limit = bytes(MAX_BYTES - 5);
         assert!(check_values([&at_limit].into_iter()).is_some());
         assert!(check_values([&at_limit, &bytes(0)].into_iter()).is_none());

@@ -1,43 +1,12 @@
-use std::fmt;
-use std::net::{IpAddr, Ipv6Addr};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, Ordering},
-};
-use std::time::Duration;
-
-use open62541::{
-    Certificate, ClientBuilder, CustomCertificateVerification, DataType, PrivateKey, ua,
-};
+use crate::secure_channel::Identity;
+pub use crate::secure_channel::SecurityPolicy;
+use crate::ua::StatusCode;
+use std::{fmt, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use x509_parser::prelude::X509Certificate;
-
-/// Security policy for a SignAndEncrypt secure channel.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SecurityPolicy {
-    /// Widely supported RSA policy.
-    #[default]
-    Basic256Sha256,
-    /// RSA-OAEP key exchange with AES-128 symmetric encryption.
-    Aes128Sha256RsaOaep,
-    /// RSA-PSS signatures with AES-256 symmetric encryption.
-    Aes256Sha256RsaPss,
-}
-
-impl SecurityPolicy {
-    /// OPC UA policy URI for endpoint selection.
-    pub const fn uri(self) -> &'static str {
-        match self {
-            Self::Basic256Sha256 => "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
-            Self::Aes128Sha256RsaOaep => {
-                "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep"
-            }
-            Self::Aes256Sha256RsaPss => {
-                "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss"
-            }
-        }
-    }
-}
+#[path = "session.rs"]
+mod session;
+pub(super) use session::Session;
 
 /// User authentication within the pinned encrypted session.
 #[derive(Clone, Copy, Default)]
@@ -115,16 +84,13 @@ pub enum ConnectError {
     /// A configuration or credential failed local validation before dialing the endpoint.
     InvalidConfiguration(&'static str),
     /// The secure channel or session could not be opened.
-    Connection(open62541::Error),
-    /// Advertised endpoint descriptions exceeded bounds or were malformed.
-    InvalidDiscovery,
+    Connection(StatusCode),
 }
 
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfiguration(reason) => f.write_str(reason),
-            Self::InvalidDiscovery => f.write_str("invalid or excessive endpoint descriptions"),
             Self::Connection(error) => write!(f, "could not open secure OPC UA session: {error}"),
         }
     }
@@ -133,55 +99,13 @@ impl fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidConfiguration(_) | Self::InvalidDiscovery => None,
+            Self::InvalidConfiguration(_) => None,
             Self::Connection(error) => Some(error),
         }
     }
 }
 
 use ConnectError::InvalidConfiguration;
-
-pub(super) fn endpoint_host(endpoint: &str) -> Result<&str, ConnectError> {
-    let invalid = || InvalidConfiguration("expected opc.tcp://HOST:PORT with an optional path");
-    if endpoint.len() > 2048
-        || endpoint.bytes().any(|b| !b.is_ascii_graphic())
-        || endpoint.contains(['?', '#', '\\'])
-    {
-        return Err(invalid());
-    }
-    let authority = endpoint
-        .strip_prefix("opc.tcp://")
-        .ok_or_else(invalid)?
-        .split('/')
-        .next()
-        .ok_or_else(invalid)?;
-    let (host, port) = authority.rsplit_once(':').ok_or_else(invalid)?;
-    if !port.bytes().all(|b| b.is_ascii_digit()) || !port.parse::<u16>().is_ok_and(|p| p != 0) {
-        return Err(invalid());
-    }
-    if let Some(ipv6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-        ipv6.parse::<Ipv6Addr>().map_err(|_| invalid())?;
-        return Ok(ipv6);
-    }
-    let name = host.strip_suffix('.').unwrap_or(host);
-    if name.len() > 253
-        || !name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-    {
-        return Err(invalid());
-    }
-    if name.bytes().all(|b| b.is_ascii_digit() || b == b'.') && name.parse::<IpAddr>().is_err() {
-        return Err(invalid());
-    }
-    Ok(name)
-}
 
 fn application_certificate<'a>(
     der: &'a [u8],
@@ -192,13 +116,6 @@ fn application_certificate<'a>(
     crate::certificate::application_certificate(der, uri, server_host, require_current)
         .map_err(InvalidConfiguration)
 }
-
-// Only the synchronous initial handshake may accept a peer certificate. After
-// it completes, the SDK must never establish another channel with cached IDs.
-const CONNECTING: u8 = 0;
-const VERIFIED: u8 = 1;
-const ACTIVE: u8 = 2;
-const INVALIDATED: u8 = 3;
 
 /// A separately provisioned successor leaf for the same server and host.
 #[derive(Clone, Copy)]
@@ -226,46 +143,51 @@ struct LeafPin {
     not_after: i64,
 }
 
-struct ServerPin {
-    leaves: Vec<LeafPin>,
-    selected: AtomicU8,
-    channel_state: Arc<AtomicU8>,
-}
-
-impl CustomCertificateVerification for ServerPin {
-    fn verify_certificate(&self, certificate: &ua::ByteString) -> ua::StatusCode {
-        if self.channel_state.load(Ordering::Acquire) >= ACTIVE {
-            self.channel_state.store(INVALIDATED, Ordering::Release);
-            return ua::StatusCode::BADCERTIFICATEUNTRUSTED;
-        }
-        // The OPC UA wire value may append issuers after the complete leaf DER.
-        // Its embedded ASN.1 length delineates the pinned leaf unambiguously.
-        let Some((index, leaf)) = self.leaves.iter().enumerate().find(|(_, leaf)| {
-            certificate
-                .as_bytes()
-                .is_some_and(|presented| presented.starts_with(&leaf.der))
-        }) else {
-            return ua::StatusCode::BADCERTIFICATEUNTRUSTED;
-        };
-        if !(leaf.not_before..=leaf.not_after).contains(&OffsetDateTime::now_utc().unix_timestamp())
-        {
-            return ua::StatusCode::BADCERTIFICATETIMEINVALID;
-        }
-        // Require the same leaf for every certificate check within this handshake.
-        let index = index as u8;
-        if let Err(previous) =
-            self.selected
-                .compare_exchange(u8::MAX, index, Ordering::AcqRel, Ordering::Acquire)
-            && previous != index
-        {
-            return ua::StatusCode::BADCERTIFICATEUNTRUSTED;
-        }
-        self.channel_state.store(VERIFIED, Ordering::Release);
-        ua::StatusCode::GOOD
-    }
-}
-
 impl ConnectionConfig<'_> {
+    /// Validate the endpoint, user, certificate bindings and matching private key locally.
+    /// This performs the same checks as a single-pin connection without dialing or resolving the host.
+    pub fn validate(&self, options: ConnectionOptions<'_>) -> Result<(), ConnectError> {
+        self.prepare(options, true).map(|_| ())
+    }
+
+    fn prepare(
+        &self,
+        options: ConnectionOptions<'_>,
+        require_current: bool,
+    ) -> Result<(LeafPin, Identity, &str), ConnectError> {
+        self.validate_input_lengths()?;
+        options.user_identity.validate()?;
+        let (host, _) = crate::discovery::address(self.endpoint).map_err(|_| {
+            InvalidConfiguration("expected opc.tcp://HOST:PORT with an optional path")
+        })?;
+        let server = application_certificate(
+            self.server_certificate_der,
+            self.server_application_uri,
+            Some(host),
+            require_current,
+        )?;
+        application_certificate(
+            self.client_certificate_der,
+            self.client_application_uri,
+            None,
+            true,
+        )?;
+        if self.client_private_key_der.first() != Some(&0x30) {
+            return Err(InvalidConfiguration(
+                "expected an unencrypted DER client private key",
+            ));
+        }
+
+        let original = LeafPin {
+            der: self.server_certificate_der.to_vec(),
+            not_before: server.validity().not_before.timestamp(),
+            not_after: server.validity().not_after.timestamp(),
+        };
+        let local = Identity::new(self.client_certificate_der, self.client_private_key_der)
+            .map_err(|_| InvalidConfiguration("certificate and RSA private key must match"))?;
+        Ok((original, local, host))
+    }
+
     pub(super) fn validate_input_lengths(&self) -> Result<(), ConnectError> {
         if [
             self.endpoint,
@@ -301,11 +223,11 @@ impl ConnectionConfig<'_> {
 
 /// A native OPC UA client connected to one pinned server.
 pub struct Client {
-    pub(super) inner: open62541::AsyncClient,
+    pub(super) inner: Arc<Session>,
     pub(super) server_uri: String,
     pub(super) reads: tokio::sync::Mutex<super::ReadSession>,
     pub(super) metadata: tokio::sync::OnceCell<super::ReadMetadata>,
-    channel_state: Arc<AtomicU8>,
+    pub(super) publish_groups: super::subscription::PublishGroups,
     pub(super) principal: String,
     pub(super) subscriptions: tokio::sync::Semaphore,
 }
@@ -343,32 +265,7 @@ impl Client {
         options: ConnectionOptions<'_>,
         rollover: Option<CertificateRollover<'_>>,
     ) -> Result<Self, ConnectError> {
-        config.validate_input_lengths()?;
-        options.user_identity.validate()?;
-        let host = endpoint_host(config.endpoint)?;
-        let server = application_certificate(
-            config.server_certificate_der,
-            config.server_application_uri,
-            Some(host),
-            rollover.is_none(),
-        )?;
-        application_certificate(
-            config.client_certificate_der,
-            config.client_application_uri,
-            None,
-            true,
-        )?;
-        if config.client_private_key_der.first() != Some(&0x30) {
-            return Err(InvalidConfiguration(
-                "expected an unencrypted DER client private key",
-            ));
-        }
-        let channel_state = Arc::new(AtomicU8::new(CONNECTING));
-        let mut original = LeafPin {
-            der: config.server_certificate_der.to_vec(),
-            not_before: server.validity().not_before.timestamp(),
-            not_after: server.validity().not_after.timestamp(),
-        };
+        let (mut original, local, host) = config.prepare(options, rollover.is_none())?;
         let mut leaves = Vec::with_capacity(2);
         if let Some(rollover) = rollover {
             rollover.validate_length()?;
@@ -393,62 +290,51 @@ impl Client {
             });
         }
         leaves.push(original);
-        let pin = ServerPin {
-            leaves,
-            selected: AtomicU8::new(u8::MAX),
-            channel_state: Arc::clone(&channel_state),
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        leaves.retain(|leaf| (leaf.not_before..=leaf.not_after).contains(&now));
+        let selected = match leaves.as_slice() {
+            [] => {
+                return Err(ConnectError::Connection(
+                    StatusCode::BadCertificateTimeInvalid,
+                ));
+            }
+            [only] => only,
+            overlapping => {
+                // The receiver thumbprint must be known before encrypting the first OPN.
+                // With two eligible leaves discovery selects between the provisioned keys.
+                let endpoints =
+                    crate::discovery::discover_endpoints(config.endpoint, config.timeout)
+                        .map_err(|e| ConnectError::Connection(session::discovery_error(e)))?;
+                overlapping
+                    .iter()
+                    .find(|leaf| {
+                        endpoints.iter().any(|ep| {
+                            ep.security_mode == 3
+                                && ep.security_policy_uri == options.security_policy.uri()
+                                && ep.application_uri == config.server_application_uri
+                                && ep.certificate.starts_with(&leaf.der)
+                        })
+                    })
+                    .ok_or(ConnectError::Connection(
+                        StatusCode::BadCertificateUntrusted,
+                    ))?
+            }
         };
-        let description = ua::ApplicationDescription::init()
-            .with_application_name("en", "opcua-kit")
-            .with_application_type(ua::ApplicationType::CLIENT)
-            .with_application_uri(config.client_application_uri);
-        let builder = ClientBuilder::default_encryption(
-            &Certificate::from_bytes(config.client_certificate_der),
-            &PrivateKey::from_bytes(config.client_private_key_der),
-        )
-        .map_err(|_| {
-            InvalidConfiguration(
-                "cannot configure encryption using the client certificate and private key",
-            )
-        })?;
-        let builder = match options.user_identity {
-            UserIdentity::Anonymous => builder,
-            UserIdentity::Username { username, password } => builder
-                .user_identity_token(&ua::UserNameIdentityToken::new(username, password).into()),
-        };
-        let client = builder
-            .client_description(description)
-            .timeout(config.timeout)
-            .security_policy_uri(
-                ua::String::new(options.security_policy.uri()).expect("static policy URI"),
-            )
-            .security_mode(ua::MessageSecurityMode::SIGNANDENCRYPT)
-            .certificate_verification(ua::CertificateVerification::custom(pin))
-            .connect(config.endpoint)
-            .map_err(ConnectError::Connection)?;
-        // UA_Client_connect has finished synchronously. Seal the verifier before
-        // into_async() gives the SDK background driver control of this client.
-        if channel_state
-            .compare_exchange(VERIFIED, ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(ConnectError::Connection(open62541::Error::Server(
-                ua::StatusCode::BADCERTIFICATEUNTRUSTED,
-            )));
-        }
+        let inner =
+            Session::connect(config, options, local, selected).map_err(ConnectError::Connection)?;
         Ok(Self {
-            inner: client.into_async(),
+            inner: Arc::new(inner),
             principal: options.user_identity.principal(),
             subscriptions: tokio::sync::Semaphore::new(8),
             server_uri: config.server_application_uri.to_owned(),
             reads: tokio::sync::Mutex::default(),
             metadata: tokio::sync::OnceCell::new(),
-            channel_state,
+            publish_groups: Default::default(),
         })
     }
 
     pub(super) fn initial_channel(&self) -> bool {
-        self.channel_state.load(Ordering::Acquire) == ACTIVE
+        self.inner.is_alive()
     }
 
     /// Authenticated contract scope: `anonymous` or `username:<account>`.
@@ -459,59 +345,5 @@ impl Client {
     /// Closes the session and stops the client's background driver.
     pub async fn disconnect(self) {
         self.inner.disconnect().await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_replacement_channel_cannot_reuse_a_session_namespace_map() {
-        let peer = ua::ByteString::new(b"test leaf");
-        let state = Arc::new(AtomicU8::new(CONNECTING));
-        let verifier = ServerPin {
-            leaves: vec![LeafPin {
-                der: b"test leaf".to_vec(),
-                not_before: 0,
-                not_after: i64::MAX,
-            }],
-            selected: AtomicU8::new(u8::MAX),
-            channel_state: Arc::clone(&state),
-        };
-        assert_eq!(verifier.verify_certificate(&peer), ua::StatusCode::GOOD);
-        assert_eq!(state.swap(ACTIVE, Ordering::AcqRel), VERIFIED);
-        assert_eq!(
-            verifier.verify_certificate(&peer),
-            ua::StatusCode::BADCERTIFICATEUNTRUSTED
-        );
-        assert_eq!(state.load(Ordering::Acquire), INVALIDATED);
-        assert_eq!(
-            verifier.verify_certificate(&peer),
-            ua::StatusCode::BADCERTIFICATEUNTRUSTED
-        );
-    }
-
-    #[test]
-    fn rollover_binds_one_leaf_for_the_whole_handshake() {
-        let verifier = ServerPin {
-            leaves: [b"planned".as_slice(), b"original".as_slice()]
-                .iter()
-                .map(|der| LeafPin {
-                    der: der.to_vec(),
-                    not_before: 0,
-                    not_after: i64::MAX,
-                })
-                .collect(),
-            selected: AtomicU8::new(u8::MAX),
-            channel_state: Arc::new(AtomicU8::new(CONNECTING)),
-        };
-        let next = ua::ByteString::new(b"planned");
-        assert_eq!(verifier.verify_certificate(&next), ua::StatusCode::GOOD);
-        assert_eq!(
-            verifier.verify_certificate(&ua::ByteString::new(b"original")),
-            ua::StatusCode::BADCERTIFICATEUNTRUSTED
-        );
-        assert_eq!(verifier.verify_certificate(&next), ua::StatusCode::GOOD);
     }
 }

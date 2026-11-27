@@ -1,5 +1,3 @@
-use open62541::DataType;
-
 use super::{
     Client, Namespaces, ReadError, ReadSession, ua,
     units::{MAX_PAGES, MAX_REFERENCES, Page, local_target, references},
@@ -97,40 +95,41 @@ fn entry(
     reference: &ua::ReferenceDescription,
 ) -> Result<BrowseEntry, BrowseError> {
     let valid_class = [
-        ua::NodeClass::OBJECT,
-        ua::NodeClass::VARIABLE,
-        ua::NodeClass::METHOD,
-        ua::NodeClass::OBJECTTYPE,
-        ua::NodeClass::VARIABLETYPE,
-        ua::NodeClass::REFERENCETYPE,
-        ua::NodeClass::DATATYPE,
-        ua::NodeClass::VIEW,
+        ua::NodeClass::Object,
+        ua::NodeClass::Variable,
+        ua::NodeClass::Method,
+        ua::NodeClass::ObjectType,
+        ua::NodeClass::VariableType,
+        ua::NodeClass::ReferenceType,
+        ua::NodeClass::DataType,
+        ua::NodeClass::View,
     ]
-    .contains(reference.node_class());
-    if !reference.is_forward() || reference.reference_type_id().is_null() || !valid_class {
+    .contains(&reference.node_class);
+    if !reference.is_forward || reference.reference_type_id.is_null() || !valid_class {
         return Err(BrowseError::InvalidReference);
     }
-    let qualified = reference.browse_name();
+    let qualified = &reference.browse_name;
     let namespace = namespaces
         .by_index
-        .get(usize::from(qualified.namespace_index()))
+        .get(usize::from(qualified.namespace_index))
         .ok_or(BrowseError::InvalidReference)?;
     let name = qualified
-        .name()
-        .as_str()
+        .name
+        .value()
+        .as_deref()
         .ok_or(BrowseError::InvalidReference)?;
     if namespace.len() > MAX_TEXT || name.len() > MAX_TEXT {
         return Err(BrowseError::Limit);
     }
-    let node = local_target(namespaces, reference.node_id())?;
+    let node = local_target(namespaces, &reference.node_id)?;
     if node.namespace() == "http://opcfoundation.org/UA/" && node.identifier() == "i=0" {
         return Err(BrowseError::InvalidReference);
     }
     Ok(BrowseEntry {
         browse_name: BrowseName::new(namespace.as_ref(), name)?,
         node,
-        reference_type: namespaces.stable_node(reference.reference_type_id())?,
-        node_class: reference.node_class().clone(),
+        reference_type: namespaces.stable_node(&reference.reference_type_id)?,
+        node_class: reference.node_class,
     })
 }
 
@@ -186,26 +185,27 @@ impl Client {
         if *pages_left == 0 {
             return Err(BrowseError::Limit);
         }
-        let mask = ua::BrowseResultMask::REFERENCETYPEINFO
-            | ua::BrowseResultMask::BROWSENAME
-            | ua::BrowseResultMask::NODECLASS;
-        let description = ua::BrowseDescription::default()
-            .with_node_id(&namespaces.wire_node(node, 0)?)
-            .with_result_mask(&mask);
-        let request = ua::BrowseRequest::init()
-            .with_requested_max_references_per_node(MAX_REFERENCES as u32)
-            .with_nodes_to_browse(&[description]);
-        let mut page = Page::First(
-            self.guarded(session, self.inner.service_request(request))
-                .await?,
-        );
+        let description = ua::BrowseDescription {
+            node_id: namespaces.wire_node(node, 0)?,
+            browse_direction: ua::BrowseDirection::Forward,
+            reference_type_id: ua::NodeId::new(0, 33u32),
+            include_subtypes: true,
+            result_mask: 0x0f,
+            node_class_mask: 0,
+        };
+        let request = ua::BrowseRequest {
+            requested_max_references_per_node: MAX_REFERENCES as u32,
+            nodes_to_browse: Some(vec![description]),
+            ..Default::default()
+        };
+        let mut page = Page::First(self.guarded(session, self.inner.request(request)).await?);
         let mut children = Vec::new();
         let mut bytes = MAX_RESULT_BYTES;
         loop {
             *pages_left -= 1;
             let (result, point) = page.checked(session)?;
             let inspected = (|| {
-                let status = result.status_code().into_raw();
+                let status = result.status_code.bits();
                 if status != 0 {
                     return Err(BrowseError::Status(status));
                 }

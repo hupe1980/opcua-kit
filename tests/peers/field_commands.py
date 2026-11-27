@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import socket
 import sys
 import tempfile
@@ -26,6 +27,7 @@ async def run(binary):
                 binary,
                 *args,
                 cwd=directory,
+                env={**os.environ, "PATH": ""},
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -93,7 +95,14 @@ async def run(binary):
             )
             assert any(child["node"] == node for child in browse)
             save(contract)
-            capture = ["capture", *secure, "--contract", "contract.json", "--output"]
+            # The client certificate supplies its application URI for both offline and live use.
+            capture = ["capture", *secure, "--contract", "contract.json"]
+            client_uri = capture.index("--client-uri")
+            del capture[client_uri : client_uri + 2]
+            logins = users.logins
+            assert b"offline" in (await command(*capture, "--preflight")).lower()
+            assert users.logins == logins
+            capture.append("--output")
             assert await command(*capture, "evidence.json") == b""
             evidence = (directory / "evidence.json").read_bytes()
             assert json.loads(evidence)["principal"] == contract["principal"]

@@ -7,14 +7,14 @@ keywords = "read_scalar read_scalars read_many read_attributes read_definition r
 group = "Embed the library"
 +++
 
-Use one client per authenticated server. The application owns credentials, scheduling, retries and shutdown. The default crate needs Rust 1.88+, a C compiler, CMake, Python 3 and libclang at build time. The deployed read path runs within the Rust process.
+An OPC UA server exposes variables in an address space. Open a pinned session to read those variables by node ID. Reuse the client across polls and disconnect it at shutdown.
 
 ## Open a session
 
-Add opcua-kit to your application. This guide targets version 0.1.
+Enable the client feature in your application.
 
 ```sh
-cargo add opcua-kit
+cargo add opcua-kit --features client
 ```
 
 Connect at startup or run the synchronous handshake on a blocking worker. Load the approved server leaf certificate, client application certificate and matching unencrypted private key as DER bytes.
@@ -36,7 +36,9 @@ fn connect(server_der: &[u8], client_der: &[u8], key_der: &[u8]) -> Result<Clien
 }
 ```
 
-This example uses the default Basic256Sha256 policy with SignAndEncrypt and an anonymous user. For named users, other supported RSA policies, and restart handling, use the [recovery guide](@/recovery.md). The server must permit that identity and trust the client application certificate. Match the URL host and configured application URIs to the appropriate certificate subject alternative names. Obtain a rotated server leaf through the site's trust process. Credentials are limited to 64 KiB each. The configured response timeout accepts 1 ms through 60 s. Set an application deadline separately when the complete polling cycle has a time budget.
+The default session signs and encrypts with Basic256Sha256 and uses an anonymous user token. The server must trust the client certificate and permit that user to read. For a named user or another policy, see the [connection options](@/recovery.md#choose-the-endpoint-and-account).
+
+Use the host name and application URIs from the certificate subject alternative names. Each credential can be up to 64 KiB. To check your configuration offline, call `config.validate(options)`. The timeout in this example applies per request (1 ms to 60 s).
 
 ## Read once or in a batch
 
@@ -69,11 +71,11 @@ async fn declares_scalar_u64(client: &Client, node: &NodeId) -> Result<bool, Rea
 
 This example requires exact Good status and the standard UInt64 declaration. Sites using a custom DataType can compare the returned identity with their reviewed mapping. A wire-type error in one field leaves the other field available on `VariableDefinition`. A Bad or Uncertain field carries its status and an absent value. A server can declare several permitted shapes. ValueRank `-1` specifies a scalar, while `-2` permits any rank. [OPC UA Variable attributes](https://reference.opcfoundation.org/specs/OPC-10000-3/5.6.2)
 
-For a point list with different attribute requirements, build `ReadOperand::new(&node, ReadAttribute::DataType)` or select any other standard node attribute. Pass the operands to `client.read_attributes(&operands).await?`. Results follow operand order and retain the SDK's raw wire types. Choose `read_definition` when persisting a declared type so the stored identifier has a namespace URI. Each attribute counts as one operation toward the 1,024-operand application limit and the server's per-request limit.
+For a point list with different attribute requirements, build `ReadOperand::new(&node, ReadAttribute::DataType)` or select any other standard node attribute. Pass the operands to `client.read_attributes(&operands).await?`. Results follow operand order and retain the UA Binary data types. Choose `read_definition` when persisting a declared type so the stored identifier has a namespace URI. Each attribute counts as one operation toward the 1,024-operand application limit and the server's per-request limit.
 
 ## Inspect engineering units
 
-A temperature sensor can switch from Celsius to Fahrenheit while keeping the same Double wire type. Read its standard EngineeringUnits property during commissioning. The default Rust client returns an `EngineeringUnitEvidence` with the property’s stable node identity, the stage that supplied the result, and a sample containing the raw status, available clocks and programmatic unit.
+A temperature sensor can switch from Celsius to Fahrenheit while keeping the same Double wire type. Read its standard EngineeringUnits property during commissioning. The client returns an `EngineeringUnitEvidence` with the property’s stable node identity, the stage that supplied the result, and a sample containing the raw status, available clocks and programmatic unit.
 
 ```rust
 use opcua_kit::{Client, EngineeringUnit, NodeId, ReadError};
@@ -87,7 +89,7 @@ async fn identified_unit(client: &Client, node: &NodeId) -> Result<Option<Engine
 }
 ```
 
-This example returns `None` for incomplete evidence under a plain Good status policy. A returned unit can match the contract or identify a definite mismatch. Compare `namespace_uri` and `unit_id` with the reviewed mapping. An empty namespace or a unit ID of −1 means the server supplied insufficient identity information. The localized display name can vary with the server’s language. The namespace and signed ID are the fields defined for programmatic identification. [OPC UA Part 8, EUInformation](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.3)
+Compare the unit’s `namespace_uri` and signed `unit_id` with the expected pair. The display name can change with the server’s language. An empty namespace or an ID of −1 leaves the unit unidentified. [OPC UA EUInformation](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.3)
 
 | Result stage | What the client observed |
 | --- | --- |
@@ -95,11 +97,13 @@ This example returns `None` for incomplete evidence under a plain Good status po
 | `DataType` or `ValueRank` | The property was found, but a required declaration was unavailable. Its status and any clocks identify the affected read. |
 | `Value` | The client verified scalar EUInformation and read the property value. Check status and identity before accepting its unit. |
 
-The client follows one forward HasProperty relationship to the standard namespace-zero EngineeringUnits name. It checks for a unique local target and verifies its declared type and scalar rank before requesting its Value. The lookup follows continuation points from servers with small browse pages. It inspects at most 256 references across at most 256 pages. A search that exceeds either limit fails before accepting a property value. Continuation tokens are limited to 64 KiB. A malformed result envelope or oversized token retires the session. Disconnect and reconnect before the next inspection. These limits apply after the SDK decodes the response. The signal’s process value is outside this operation. A conflicting declaration or ambiguous target fails the inspection. The application supplies the physical meaning of the variable.
+The lookup follows forward HasProperty references to a unique, local EngineeringUnits property in the standard namespace. It checks for scalar EUInformation before reading the property. The signal’s process value is never requested.
+
+The search accepts up to 256 references across 256 pages and continuation tokens up to 64 KiB. Conflicting declarations, ambiguous targets or exceeded limits fail the inspection. A malformed response or oversized continuation token retires the session.
 
 ## Inspect a signal contract
 
-With the default client and the `commissioning` feature, parse the gateway’s reviewed contract once and use the pinned session to collect a schema-v1 snapshot. A contract can describe any combination of variables, such as a fan state, pressure and supply temperature.
+With the `client` and `commissioning` features, parse the gateway’s reviewed contract once and use the pinned session to collect a schema-v1 snapshot. A contract can describe any combination of variables, such as a fan state, pressure and supply temperature.
 
 ```rust
 use opcua_kit::{Client, SnapshotReadError};
@@ -112,7 +116,7 @@ async fn commission(client: &Client, contract: &Contract) -> Result<Snapshot, Sn
 
 The contract must select the authenticated server application URI and the session principal (anonymous or `username:<account>`). Results follow contract order. DataType is always requested for resolved signals. ValueRank and the standard EngineeringUnits property are inspected when the contract requests them. Before reading a unit property's Value, the client verifies its identity, declared type and rank, and checks it against every contracted process node. The three standard bootstrap nodes ServerArray, NamespaceArray and MaxNodesPerRead are reserved.
 
-Pass the result to `commissioning::assess`, or save it with Serde for a follow-up comparison. A missing namespace yields an identity-only row. A completed operation with no usable payload retains its status. A malformed response, unsafe property, session failure or size overflow returns a typed error and discards the partial capture. The compact snapshot including its final newline fits 4 MiB. This limit applies after SDK decoding. Reads share a serialized session and can observe changes between requests. A host can set its own deadline around the future. [Field workflow](@/capture.md#capture-with-the-native-client) · [Evidence schema](@/automation.md)
+Pass the result to `commissioning::assess`, or save it with Serde for a follow-up comparison. A missing namespace yields an identity-only row. A completed operation with no usable payload retains its status. A malformed response, unsafe property, session failure or size overflow returns a typed error and discards the partial capture. The compact snapshot including its final newline fits 4 MiB. This limit applies after response decoding. Reads share a serialized session and can observe changes between requests. A host can set its own deadline around the future. [Field workflow](@/capture.md#capture-and-assess) · [Evidence schema](@/automation.md)
 
 ## Poll several variables
 
@@ -134,9 +138,9 @@ async fn inspect(client: &Client, nodes: &[NodeId]) -> Result<(), ReadError> {
 }
 ```
 
-For mixed wire types, call `client.read_many(&nodes).await?` and decode each member with `Sample::<T>::from_raw`. Both APIs accept up to 1,024 nodes per call, preserve duplicates and return results in input order. This count bounds operations. Raw reads retain the complete returned values, including arrays. For fixed-width registers, typed polling releases each raw response after decoding its samples. An empty input succeeds locally. The client resolves every namespace before the first target read. An unknown namespace reports its input index.
+For mixed types, use `client.read_many(nodes).await?` to get raw `ua::DataValue`s. Decode each with `Sample::<T>::from_raw` or inspect its Variant directly. Both batch APIs preserve input order and duplicates, accept up to 1,024 nodes, and return an empty result for empty input. An unknown namespace fails the batch before any target is read.
 
-The client discovers `MaxNodesPerRead` for the authenticated session and splits the call into sequential Read requests. A server advertising two operations receives five target reads in groups of two, two and one. A missing value, zero limit, or Uncertain or Bad item status selects one request per point. A present limit with Good severity must be a UInt32 scalar. A different type fails discovery before any target is read. Different requests can observe different instants. Use each node's clocks when correlating signals. [OPC UA operation limits](https://reference.opcfoundation.org/specs/OPC-10000-5/6.3.11)
+The server’s `MaxNodesPerRead` sets the wire batch size. If the limit is absent, zero, or reported with Uncertain or Bad status, the client requests one operation at a time. A present Good-severity value must be a UInt32 scalar. Each batch can sample a different instant, so use the per-node clocks to correlate values. [OPC UA operation limits](https://reference.opcfoundation.org/specs/OPC-10000-5/6.3.11)
 
 A failed service request discards accumulated results. After a service failure, channel change, or cancellation during dispatch, reconnect before retrying. A per-node Bad status leaves the session usable. The response timeout applies to individual requests. If the plant needs a deadline for the entire poll, wrap the call in the application's timeout. Call `client.disconnect().await` at shutdown.
 
@@ -153,16 +157,16 @@ Both timestamp fields retain the base in Unix nanoseconds and the optional incre
 
 ## Try the same session from a terminal
 
-Install the field tool with `cargo install opcua-kit --locked --features cli`.
+Install the field tool with `cargo install opcua-kit --locked --features cli`. It reads PEM or DER credential files and takes the client application URI from the certificate. Supply `--client-uri` to check it against an expected URI.
 
 ```sh
 opcua-kit read --endpoint opc.tcp://plc.example:4840 \
   --server-uri urn:plant:server --server-cert server.der \
-  --client-uri urn:factory:dashboard --client-cert client.der --client-key client-key.der \
+  --client-cert client.der --client-key client-key.der \
   --namespace urn:plant:line-1 --id s=PartsProduced
 ```
 
-The command prints one JSON record for a present UInt64 with status 0. Any other status, missing value, type mismatch or connection error exits 1 with a diagnostic on stderr and leaves stdout empty. Applications using the library can apply their own policy to the full status. Keep the value as an integer when decoding JSON, especially above 2⁵³. Use the commissioning collector to capture a contract’s metadata. [Capture guide](@/capture.md)
+The command prints one JSON record for a present UInt64 with status 0. Any other status, missing value, type mismatch or connection error exits 1 with a diagnostic on stderr and leaves stdout empty. Applications using the library can apply their own policy to the full status. Keep the value as an integer when decoding JSON, especially above 2⁵³. Use `opcua-kit capture` to inspect a contract’s metadata. [Capture guide](@/capture.md)
 
 To inspect a mapping without sampling its process value, use `opcua-kit describe` with the same connection and node arguments. A complete response for a standard scalar UInt64 looks like this.
 
@@ -177,7 +181,7 @@ To inspect the units on a supply temperature sensor, run the following command.
 ```sh
 opcua-kit describe --units --endpoint opc.tcp://plc.example:4840 \
   --server-uri urn:plant:server --server-cert server.der \
-  --client-uri urn:factory:dashboard --client-cert client.der --client-key client-key.der \
+  --client-cert client.der --client-key client-key.der \
   --namespace urn:plant:line-1 --id s=SupplyTemperature
 ```
 

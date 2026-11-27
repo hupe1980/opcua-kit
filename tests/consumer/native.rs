@@ -149,8 +149,8 @@ async fn verify_attributes(client: &Client, partial: bool) {
         panic!("one result per attribute was expected");
     };
     assert_eq!(Sample::<f64>::from_raw(value).unwrap().value, Some(22.0));
-    assert_eq!(absent.status(), Some(ua::StatusCode::BADNODEIDUNKNOWN));
-    assert!(ty.value().unwrap().as_scalar::<ua::NodeId>().is_some());
+    assert_eq!(absent.status, Some(ua::StatusCode::BadNodeIdUnknown));
+    assert!(matches!(ty.value, Some(ua::Variant::NodeId(_))));
     for raw in [rank, repeated] {
         assert_eq!(Sample::<i32>::from_raw(raw).unwrap().value, Some(-1));
     }
@@ -217,7 +217,7 @@ async fn verify_limited_reads(client: &Client, change_limit: bool) {
         ];
         assert!(matches!(
             client.read_scalars::<u64>(&interrupted).await,
-            Err(ReadError::Service(error)) if error.status_code() == ua::StatusCode::BADTOOMANYOPERATIONS
+            Err(ReadError::Service(error)) if error == ua::StatusCode::BadTooManyOperations
         ));
         assert!(matches!(
             client.read(&meter).await,
@@ -400,7 +400,7 @@ async fn main() {
         .await
         .expect("read mixed statuses");
     assert_eq!(mixed.len(), 4);
-    assert_eq!(mixed[0].status(), Some(ua::StatusCode::BADNODEIDUNKNOWN));
+    assert_eq!(mixed[0].status, Some(ua::StatusCode::BadNodeIdUnknown));
     let missing = Sample::<u64>::from_raw(&mixed[0]).unwrap();
     assert_eq!(missing.status, 0x8034_0000);
     assert_eq!(missing.value, None);

@@ -48,7 +48,7 @@ impl DemoScenario {
 #[command(
     name = "opcua-kit",
     version,
-    about = "Check the OPC UA signals a gateway depends on",
+    about = "Inspect OPC UA endpoints, read variables and verify commissioning contracts",
     after_help = "Start offline with 'opcua-kit demo'. Run a subcommand with --help for examples."
 )]
 struct Cli {
@@ -151,15 +151,9 @@ enum MeterCommand {
     },
     /// Verify the declared register and write one timestamped reading as a JSON line.
     #[command(
-        after_help = "Use one reviewed scalar UInt32, UInt64, Float or Double register in Wh. Supply --client-uri with DER credentials to read in process. Append successful observations to your readings file."
+        after_help = "Use one reviewed scalar UInt32, UInt64, Float or Double register in Wh. Append successful observations to your readings file."
     )]
-    Read {
-        #[command(flatten)]
-        connection: Connection,
-        /// Read with the native client using this application URI and DER credentials.
-        #[arg(long, value_name = "URI", conflicts_with = "insecure_loopback")]
-        client_uri: Option<String>,
-    },
+    Read(Connection),
     /// Project saved readings and independent quarter-hour closes into a cemsd trace.
     #[command(
         after_help = "Use '--output trace.json' to save a new trace, then run 'cemsd reconcile trace.json' to check its coverage and differences."
@@ -205,37 +199,13 @@ enum ContractCommand {
 #[derive(Args)]
 struct Connection {
     #[command(flatten)]
-    session: native::SessionArgs,
+    credentials: native::Credentials,
     /// Reviewed contract specifying the device, principal and signals.
     #[arg(long)]
     contract: PathBuf,
     /// An explicitly selected opc.tcp endpoint URL.
     #[arg(long)]
     endpoint: String,
-    /// Pinned server leaf certificate (native: DER, Python collector: PEM or DER).
-    #[arg(
-        long,
-        required_unless_present = "insecure_loopback",
-        conflicts_with = "insecure_loopback"
-    )]
-    server_cert: Option<PathBuf>,
-    /// Client application certificate (native: DER, Python collector: PEM or DER).
-    #[arg(
-        long,
-        required_unless_present = "insecure_loopback",
-        conflicts_with = "insecure_loopback"
-    )]
-    client_cert: Option<PathBuf>,
-    /// Unencrypted client private key (native: DER, Python collector: PEM or DER).
-    #[arg(
-        long,
-        required_unless_present = "insecure_loopback",
-        conflicts_with = "insecure_loopback"
-    )]
-    client_key: Option<PathBuf>,
-    /// Allow plaintext on a literal loopback IP address for local fixtures.
-    #[arg(long)]
-    insecure_loopback: bool,
     /// Network collection deadline in seconds.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=300))]
     timeout: u64,
@@ -245,10 +215,7 @@ struct Connection {
 struct Capture {
     #[command(flatten)]
     connection: Connection,
-    /// Capture in process with DER credentials and the application URI in the client certificate.
-    #[arg(long, value_name = "URI", conflicts_with_all = ["preflight", "insecure_loopback"])]
-    client_uri: Option<String>,
-    /// Check the cached runtime, contract and local security configuration without contacting the endpoint.
+    /// Check the contract, endpoint and local credentials without opening a network connection.
     #[arg(long, conflicts_with = "output")]
     preflight: bool,
     /// Atomically replace this snapshot after a successful capture. Default is stdout.
@@ -538,17 +505,10 @@ fn run(cli: Cli) -> Result<u8> {
             )
         }
         #[cfg(feature = "cems")]
-        Commands::Meter(MeterCommand::Read {
-            connection,
-            client_uri,
-        }) => {
+        Commands::Meter(MeterCommand::Read(connection)) => {
             let contract = parse_contract(&read_document(&connection.contract)?)?;
             validate_meter_contract(&contract)?;
-            if let Some(uri) = client_uri {
-                native::read_meter(connection, uri, &contract)
-            } else {
-                capture::read_meter(&connection, &contract)
-            }
+            native::read_meter(connection, contract)
         }
         #[cfg(feature = "cems")]
         Commands::Meter(MeterCommand::Trace {

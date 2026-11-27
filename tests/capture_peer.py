@@ -9,7 +9,6 @@ import re
 import socket
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -79,8 +78,18 @@ def snapshot_signal(name, dtype="i=11", *, rank=False, unit=False):
     return signal
 
 
-def certificate(folder, stem, *, uri=None, host="127.0.0.1", expired=False):
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def certificate(
+    folder,
+    stem,
+    *,
+    uri=None,
+    host="127.0.0.1",
+    expired=False,
+    key_bits=2048,
+    extra_uri=None,
+    ca=False,
+):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=key_bits)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, stem)])
     now = datetime.now(UTC)
     usage = (
@@ -91,11 +100,13 @@ def certificate(folder, stem, *, uri=None, host="127.0.0.1", expired=False):
     names = [
         x509.IPAddress(ipaddress.ip_address(host)),
         x509.DNSName("localhost"),
-        x509.UniformResourceIdentifier(uri or "urn:fixture:server"),
+        x509.UniformResourceIdentifier("urn:fixture:server" if uri is None else uri),
     ]
+    if extra_uri is not None:
+        names.append(x509.UniformResourceIdentifier(extra_uri))
     if stem == "server" and socket.gethostname() != "localhost":
         names.append(x509.DNSName(socket.gethostname().encode("idna").decode("ascii")))
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
@@ -104,7 +115,6 @@ def certificate(folder, stem, *, uri=None, host="127.0.0.1", expired=False):
         .not_valid_before(now - timedelta(days=3))
         .not_valid_after(now + timedelta(days=-1 if expired else 2))
         .add_extension(x509.SubjectAlternativeName(names), False)
-        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
         .add_extension(
             x509.KeyUsage(True, True, True, True, False, False, False, None, None), True
         )
@@ -115,8 +125,12 @@ def certificate(folder, stem, *, uri=None, host="127.0.0.1", expired=False):
         .add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), False
         )
-        .sign(key, hashes.SHA256())
     )
+    if ca is not None:
+        builder = builder.add_extension(
+            x509.BasicConstraints(ca=ca, path_length=None), True
+        )
+    cert = builder.sign(key, hashes.SHA256())
     (folder / f"{stem}.der").write_bytes(cert.public_bytes(serialization.Encoding.DER))
     (folder / f"{stem}.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     if stem == "client":
@@ -189,24 +203,25 @@ class CapturePeer(unittest.TestCase):
 
     def collect(self, *args, contract=None, endpoint=None, env=None, meter=False):
         contract = contract or CONTRACT
-        binary = os.environ.get("OPCUA_KIT_BIN")
-        if binary:
-            file = self.folder / "contract.json"
-            file.write_text(json.dumps(contract))
-            action = ["meter", "read"] if meter else ["capture"]
-            cmd = [binary, *action, "--contract", str(file)]
-        else:
-            cmd = [sys.executable, str(ROOT / "src/bin/opcua-kit/capture.py")]
-            if meter:
-                cmd.append("--meter-read")
+        file = self.folder / "contract.json"
+        file.write_text(json.dumps(contract))
+        action = ["meter", "read"] if meter else ["capture"]
+        binary = os.environ.get("OPCUA_KIT_BIN") or str(ROOT / "target/debug/opcua-kit")
         return subprocess.run(
-            [*cmd, "--endpoint", endpoint or self.url, *args],
-            input=json.dumps(contract),
+            [
+                binary,
+                *action,
+                "--contract",
+                str(file),
+                "--endpoint",
+                endpoint or self.url,
+                *args,
+            ],
             check=False,
             capture_output=True,
             text=True,
             cwd=self.folder,
-            env=env,
+            env=env if env is not None else {**os.environ, "PATH": ""},
             timeout=45,
         )
 
@@ -714,28 +729,101 @@ class CapturePeer(unittest.TestCase):
             json.loads(captured.stdout)["applicationUri"], CONTRACT["applicationUri"]
         )
 
-    def test_empty_offline_runtime_cache_gives_preparation_hint(self):
-        # 005-capture-preflight/SR-001 005-capture-preflight/SR-003
-        if not os.environ.get("OPCUA_KIT_BIN"):
-            self.skipTest("the Rust launcher owns the uv dependency cache")
-        with tempfile.TemporaryDirectory() as cache, socket.socket() as index:
-            index.bind(("127.0.0.1", 0))
-            index.listen()
-            url = f"http://127.0.0.1:{index.getsockname()[1]}/simple"
-            env = {
-                **os.environ,
-                "UV_CACHE_DIR": cache,
-                "UV_DEFAULT_INDEX": url,
-                "UV_INDEX_URL": url,
-            }
-            out = self.collect("--preflight", *self.secure(), env=env)
-            index.setblocking(False)
+    # 022-native-commissioning/SR-001
+    def test_preflight_checks_pem_der_local_identity_and_signing_key(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            endpoint = f"opc.tcp://127.0.0.1:{listener.getsockname()[1]}"
+            pem = self.secure()
+            der = [
+                "--server-cert",
+                "server.der",
+                "--client-cert",
+                "client.der",
+                "--client-key",
+                "client-key.der",
+            ]
+            key = serialization.load_pem_private_key(
+                (self.folder / "client.key").read_bytes(), None
+            )
+            encodings = [pem, der]
+            for suffix, encoding in [
+                ("pem", serialization.Encoding.PEM),
+                ("der", serialization.Encoding.DER),
+            ]:
+                legacy_key = self.folder / f"pkcs1.{suffix}"
+                legacy_key.write_bytes(
+                    key.private_bytes(
+                        encoding,
+                        serialization.PrivateFormat.TraditionalOpenSSL,
+                        serialization.NoEncryption(),
+                    )
+                )
+                encodings.append([*der[:-1], legacy_key])
+            for options in encodings:
+                for assertion in [[], ["--client-uri", "urn:fixture:client"]]:
+                    ready = self.collect(
+                        "--preflight", *options, *assertion, endpoint=endpoint
+                    )
+                    self.assertEqual(ready.returncode, 0, ready.stderr)
+                    self.assertIn("offline", ready.stdout.lower())
+                    self.assertEqual(ready.stderr, "")
+            ambiguous = self.folder / "ambiguous-identity"
+            ambiguous.mkdir()
+            certificate(
+                ambiguous,
+                "client",
+                uri="urn:fixture:client",
+                extra_uri="urn:fixture:second",
+            )
+            multiple_uris = [
+                *pem[:3],
+                str(ambiguous / "client.pem"),
+                "--client-key",
+                str(ambiguous / "client.key"),
+            ]
+            for options in [
+                multiple_uris,
+                [*multiple_uris, "--client-uri", "urn:fixture:client"],
+                [*pem, "--client-uri", "urn:fixture:wrong-client"],
+                self.secure("expired"),
+                self.secure("wronghost"),
+                [*pem[:3], "server.pem", *pem[4:]],
+                [*pem[:-1], "client.pem"],
+            ]:
+                with self.subTest(options=options):
+                    refused = self.collect("--preflight", *options, endpoint=endpoint)
+                    self.assertEqual(refused.returncode, 1, refused.stderr)
+                    self.assertEqual(refused.stdout, "")
+                    self.assertNotIn("BEGIN", refused.stderr)
+            listener.setblocking(False)
             with self.assertRaises(BlockingIOError):
-                index.accept()
-        self.assertEqual(out.returncode, 1)
-        self.assertEqual(out.stdout, "")
-        self.assertIn("uv run", out.stderr)
-        self.assertIn("asyncua==2.1.0", out.stderr)
+                listener.accept()
+
+    def test_preflight_requires_an_application_leaf_and_absolute_uri(self):
+        for label, profile in [
+            ("issuer", {"ca": True}),
+            ("unconstrained", {"ca": None}),
+            ("relative", {"uri": "relative"}),
+            ("empty", {"uri": ""}),
+        ]:
+            with self.subTest(profile=label):
+                case = self.folder / label
+                case.mkdir()
+                certificate(case, "client", **profile)
+                options = [
+                    "--server-cert",
+                    "server.pem",
+                    "--client-cert",
+                    case / "client.pem",
+                    "--client-key",
+                    case / "client.key",
+                ]
+                refused = self.collect("--preflight", *options)
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertEqual(refused.stdout, "")
+                self.assertNotIn("PRIVATE KEY", refused.stderr)
 
     def test_encrypted_meter_evidence_preserves_register_and_clock(self):
         # 006-meter-pilot/SR-001 006-meter-pilot/SR-002
@@ -750,7 +838,7 @@ class CapturePeer(unittest.TestCase):
         self.check_meter_handoff("GridImportDoubleWh", "i=11", 2**52 + 1)
 
     def read_meter(self, path, contract, endpoint, *, repeat=False, timeout=5):
-        if path == "collector":
+        if path == "cli-pem":
             return self.collect(
                 *self.secure(), contract=contract, endpoint=endpoint, meter=True
             )
@@ -993,7 +1081,7 @@ class CapturePeer(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def check_meter_handoff(self, node, dtype, start_wh, path="collector"):
+    def check_meter_handoff(self, node, dtype, start_wh, path="cli-pem"):
         contract = meter_contract(node, dtype)
         signal = contract["signals"][0]
 
@@ -1003,7 +1091,7 @@ class CapturePeer(unittest.TestCase):
         # The peer observes the OPC UA ReadRequest, including when the server
         # can satisfy it from cache. A metadata snapshot must never read this Value.
         initial = read_count("server")
-        if path == "collector":
+        if path == "cli-pem":
             snapshot = self.collect(*self.secure(), contract=contract)
             self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
             self.assertEqual(read_count("server"), initial)
@@ -1174,22 +1262,18 @@ class CapturePeer(unittest.TestCase):
 
     def test_secure_metadata_matches_independent_peer(self):
         # 001-commissioning-check/SR-001, 001-commissioning-check/SR-005
-        for options in [self.secure(), ["--insecure-loopback"]]:
-            with self.subTest(options=options[:1]):
-                result = self.collect(*options)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                snapshot = json.loads(result.stdout)
-                rows = {row["name"]: row for row in snapshot["signals"]}
-                self.assertEqual(
-                    rows["sensor"]["dataType"],
-                    {"status": 0, "value": {"namespace": UA, "id": "i=12"}},
-                )
-                self.assertEqual(
-                    rows["sensor"]["valueRank"], {"status": 0, "value": -1}
-                )
-                self.assertEqual(rows["unknown"]["dataType"], {"status": 0x80340000})
-                self.assertNotIn("PRIVATE PROCESS VALUE", result.stdout + result.stderr)
-                self.assertNotIn("PRIVATE KEY", result.stdout + result.stderr)
+        result = self.collect(*self.secure())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        rows = {row["name"]: row for row in snapshot["signals"]}
+        self.assertEqual(
+            rows["sensor"]["dataType"],
+            {"status": 0, "value": {"namespace": UA, "id": "i=12"}},
+        )
+        self.assertEqual(rows["sensor"]["valueRank"], {"status": 0, "value": -1})
+        self.assertEqual(rows["unknown"]["dataType"], {"status": 0x80340000})
+        self.assertNotIn("PRIVATE PROCESS VALUE", result.stdout + result.stderr)
+        self.assertNotIn("PRIVATE KEY", result.stdout + result.stderr)
 
     @unittest.skipUnless(
         os.environ.get("OPCUA_KIT_NATIVE_COMMISSIONING_BIN"),
@@ -1701,8 +1785,10 @@ class CapturePeer(unittest.TestCase):
         self.assertNotIn("PRIVATE", result.stdout + result.stderr)
         self.assertEqual(
             json.loads(result.stdout)["signals"][0]["engineeringUnits"],
-            {"status": 0x806F0000},
-        )  # BadNoMatch
+            {
+                "status": 0
+            },  # The peer completed Browse and returned no matching property.
+        )
         snapshot = self.folder / "missing-property.json"
         snapshot.write_text(result.stdout)
         checked = self.check_captures(contract, [snapshot, snapshot])
@@ -1712,6 +1798,7 @@ class CapturePeer(unittest.TestCase):
             {"matched": 2, "mismatch": 0, "unverified": 1},
         )
 
+    # 022-native-commissioning/SR-003
     def test_unit_target_alias_preserves_previous_snapshot(self):
         # 002-engineering-units/SR-001, 002-engineering-units/SR-003
         if not os.environ.get("OPCUA_KIT_BIN"):
@@ -1747,17 +1834,16 @@ class CapturePeer(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
         other = copy.deepcopy(CONTRACT)
         other["applicationUri"] = "urn:fixture:wrong-app"
-        for options in [self.secure(), ["--insecure-loopback"]]:
-            result = self.collect(*options, contract=other)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(result.stdout, "")
+        result = self.collect(*self.secure(), contract=other)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
     def test_correct_pin_wrong_signed_session_identity(self):
         # 001-commissioning-check/SR-001
         result = self.collect(*self.secure(), endpoint=self.other_uri)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
-        self.assertIn("application URI", result.stderr)
+        self.assertIn("BadCertificateUriInvalid", result.stderr)
 
     def test_live_timeout(self):
         # 001-commissioning-check/SR-003
@@ -1765,16 +1851,19 @@ class CapturePeer(unittest.TestCase):
             stalled.bind(("127.0.0.1", 0))
             stalled.listen()
             endpoint = f"opc.tcp://127.0.0.1:{stalled.getsockname()[1]}"
-            result = self.collect(
-                "--insecure-loopback", "--timeout", "1", endpoint=endpoint
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("timed out", result.stderr)
+            started = time.monotonic()
+            result = self.collect(*self.secure(), "--timeout", "1", endpoint=endpoint)
+            self.assertLess(time.monotonic() - started, 4)
+            self.assertEqual(result.returncode, 1)
+            self.assertTrue(result.stderr)
             self.assertEqual(result.stdout, "")
+            stalled.setblocking(False)
+            connection, _ = stalled.accept()
+            connection.close()
 
-    def test_cleartext_requires_literal_loopback(self):
+    def test_capture_refuses_cleartext_even_on_loopback(self):
         # 001-commissioning-check/SR-001
-        for host in ("localhost", "192.0.2.1"):
+        for host in ("127.0.0.1", "localhost", "192.0.2.1"):
             result = self.collect(
                 "--insecure-loopback", endpoint=f"opc.tcp://{host}:4840"
             )

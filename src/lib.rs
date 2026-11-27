@@ -1,32 +1,27 @@
+#![forbid(unsafe_code)]
 #![cfg_attr(
-    not(any(feature = "client", feature = "commissioning", feature = "server")),
+    not(any(feature = "discovery", feature = "commissioning", feature = "server")),
     no_std
 )]
 //! Embed OPC UA protocol services in a Rust application.
 //!
-//! The default `client` feature uses open62541 for UA Binary over OPC TCP. It provides
-//! endpoint discovery, pinned sessions, browsing, typed reads, grouped data changes, event streams,
-//! raw historical reads and reconnect handling. The application owns credentials and scheduling.
+//! The default build implements UA TCP endpoint discovery and UADP key frames in Rust.
+//! Both can be embedded without third-party dependencies. Discovery lists the policies an endpoint advertises.
+//! Before connecting, provision the approved server certificate and application URI.
 //!
-//! ```
-//! # #[cfg(feature = "client")]
-//! # async fn example(client: &opcua_kit::Client) -> Result<(), Box<dyn std::error::Error>> {
-//! use opcua_kit::{NodeId, Sample};
-//!
-//! let node = NodeId::new("urn:factory:line-1", "s=PartsProduced")?;
-//! let sample: Sample<u64> = client.read_scalar(&node).await?;
-//! if let (0, Some(count)) = (sample.status, sample.value) {
-//!     println!("parts produced = {count}");
-//! }
+//! ```no_run
+//! # #[cfg(feature = "discovery")]
+//! # fn run() -> Result<(), opcua_kit::DiscoveryError> {
+//! use std::time::Duration;
+//! let endpoints = opcua_kit::discover_endpoints("opc.tcp://localhost:4840", Duration::from_secs(5))?;
+//! for endpoint in endpoints { println!("{}", endpoint.security_policy_uri); }
 //! # Ok(()) }
 //! ```
 //!
-//! Enable `control` for explicit Write and Call, `server` for host-owned variables,
-//! and `pubsub` for a standalone UADP key-frame codec.
-//! Enable `commissioning` to inspect signal metadata and assess a reviewed contract.
-//! Enable `cems` for energy-meter collection and interval reconciliation.
-//! Both commissioning and meter processing can run offline with default features disabled.
-//! The standalone `pubsub` feature supports `no_std` targets with an allocator.
+//! The optional `client` and `server` features provide Rust implementations of sessions,
+//! reads, subscriptions and serving host-owned variables. `control` adds writes and calls.
+//! `commissioning` and `cems` support offline signal checks and meter processing.
+//! Enable only `pubsub` for the standalone `no_std` codec with an allocator.
 //! With all features disabled, the crate provides a dependency-free `no_std` status classifier.
 
 #[cfg(any(feature = "client", feature = "commissioning"))]
@@ -48,19 +43,31 @@ pub use client::SnapshotReadError;
 pub use client::{CallOutcome, ConditionComment, ConditionError, Control, ControlError};
 
 #[cfg(feature = "client")]
+pub use certificate::certificate_application_uri;
+
+#[cfg(feature = "client")]
 pub use client::{
     ArrayValue, BrowseEntry, BrowseError, BrowseName, CertificateRollover, Client, ConnectError,
-    ConnectionConfig, ConnectionOptions, DataChange, DataChanges, EndpointInfo, EndpointToken,
-    EngineeringUnitEvidence, EventError, EventField, Events, FixedScalar, HistoricalRead,
-    HistoryError, MAX_MONITORED_NODES, MAX_READ_NODES, MonitoredDataChanges, MonitoredNode,
-    PublishError, ReadAttribute, ReadError, ReadOperand, RecoveredSession, RecoveringClient,
-    RecoveryError, Sample, SampleTimestamp, Scalar, SecurityPolicy, Sequenced,
-    SequencedDataChanges, SessionState, SubscriptionError, TimestampError, UnitStage, UserIdentity,
-    VariableDefinition, discover_endpoints,
+    ConnectionConfig, ConnectionOptions, DataChange, DataChanges, EngineeringUnitEvidence,
+    EventError, EventField, Events, FixedScalar, HistoricalRead, HistoryError, MAX_MONITORED_NODES,
+    MAX_READ_NODES, MonitoredDataChanges, MonitoredNode, PublishError, ReadAttribute, ReadError,
+    ReadOperand, RecoveredSession, RecoveringClient, RecoveryError, Sample, SampleTimestamp,
+    Scalar, SecurityPolicy, Sequenced, SequencedDataChanges, SessionState, SubscriptionError,
+    TimestampError, UnitStage, UserIdentity, VariableDefinition,
 };
+
+#[cfg(feature = "discovery")]
+pub mod discovery;
+#[cfg(feature = "discovery")]
+pub use discovery::{DiscoveryError, EndpointInfo, EndpointToken, discover_endpoints};
 
 #[cfg(feature = "client")]
 pub mod client;
+
+#[cfg(any(feature = "client", feature = "server"))]
+mod secure_channel;
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod ua;
 
 #[cfg(feature = "commissioning")]
 pub mod commissioning;

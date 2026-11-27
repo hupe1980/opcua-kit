@@ -1,4 +1,4 @@
-// Exercise a downstream default-feature Rust consumer against both independent SDKs.
+// Exercise a downstream Rust session client against both independent SDKs.
 use opcua_kit::{
     Client, NodeId, Sample,
     client::{BrowseError, BrowseName, SubscriptionError},

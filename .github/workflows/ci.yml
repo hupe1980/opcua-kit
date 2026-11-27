@@ -19,8 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
-      - run: python3 contrib/verify-backend.py
       - run: cargo install cargo-audit --locked --version 0.22.1
       - run: cargo audit --deny warnings
       - run: rustup toolchain install 1.88.0 --profile minimal
@@ -47,12 +45,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
       - uses: astral-sh/setup-uv@v6
-      - run: uv run --isolated --no-config --no-project --with asyncua==2.1.0 --python 3.13 python tests/capture_limits.py
       - run: tests/peers/run.sh
       - run: bash tests/peers/recovery.sh
       - run: bash tests/peers/protocol.sh
@@ -64,10 +60,9 @@ jobs:
       - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/local_server.py target/debug/examples/local_server
       - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/secure_server.py target/debug/examples/local_server
       - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/uadp.py target/debug/examples/uadp
-      - run: uv run --isolated --no-project --python 3.13 --with asyncua==2.1.0 python tests/peers/field_commands.py target/debug/opcua-kit
-      - name: Verify packaged SDK, offline library and CLI
+      - name: Verify packaged crate, offline library and CLI
         run: python3 tests/verify_package.py
-      - name: Verify event delivery with the registry backend from the archive
+      - name: Verify event delivery with the registry dependencies in the archive
         run: |
           archive=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; m=json.load(sys.stdin); p=m["packages"][0]; print("{}/package/{}-{}".format(m["target_directory"],p["name"],p["version"]))')
           cd "$archive"

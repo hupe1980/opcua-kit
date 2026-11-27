@@ -7,7 +7,7 @@ keywords = "pubsub server control UADP Republish Events ConditionRefresh Acknowl
 group = "Embed the library"
 +++
 
-Use the default client to discover, browse and observe a server. Add `control` when application code needs Write or Method Call. Enable `server` to expose host-owned variables, or `pubsub` to exchange binary datasets. An application can combine these features. CEMS adds its meter contract and interval logic independently.
+The default build implements discovery and UADP in Rust. Enable the `client` feature to browse and observe a server. Add `control` when application code needs Write or Method Call. Enable the `server` feature to expose host-owned variables. An application can combine these features. CEMS adds its meter contract and interval logic independently.
 
 ## Observe a group of signals
 
@@ -25,17 +25,19 @@ async fn sample(client: &Client, nodes: &[NodeId]) -> Result<(), SubscriptionErr
 }
 ```
 
-Select 1–32 items per group. Inspect `items()` for the revised sampling parameters. Each client supports eight active groups. A wait timeout leaves the group usable. Local queue overflow, an oversized value, a server overflow report or loss of the session ends the stream. Resubscribe and record the gap. The native data-change callback omits Publish sequence numbers. [Subscription delivery](@/navigation.md)
+Select 1–32 items per group. Inspect `items()` for the revised sampling parameters. Each client supports eight active groups. A wait timeout leaves the group usable. Local queue overflow, an oversized value, a server overflow report or loss of the session ends the stream. Resubscribe and record the gap. Each change identifies its monitored item. Use a sequenced subscription when the application needs Publish sequence numbers. [Subscription delivery](@/navigation.md)
 
 ### Preserve notification sequence and recover retained messages
 
 Use `SequencedDataChanges::connect(config, options, nodes, interval).await` when the host needs the OPC UA NotificationMessage sequence as well as the input index. This opens a dedicated pinned session. Its `next(wait)` returns a `Sequenced<DataChange>` containing the sequence number, a `republished` flag and the indexed value. Several values can share a sequence number. Events expose the same provenance through `next_with_sequence`.
 
-If a later Publish response advertises missing retained messages, the stream requests up to eight consecutive messages with Republish and delivers them in order. An unavailable message or a larger discontinuity yields `PublishError::SequenceGap`. Each response holds up to 32 notifications, with 128 KiB per notification and a 4 MiB aggregate projection budget for a repair round after native decoding. Monitor item queue overflow independently: repaired Publish delivery cannot recover changes the server discarded before publishing. After an endpoint restart or certificate cutover, open a new session and reconcile across generations. Call `disconnect().await` to wait for session closure. Dropping a stream schedules best-effort cleanup on its creating runtime. [OPC UA Republish](https://reference.opcfoundation.org/specs/OPC-10000-4/5.14.6)
+When a Publish response identifies a gap, the stream requests up to eight consecutive retained messages through Republish and delivers them in order. An unavailable message or a larger gap yields `PublishError::SequenceGap`. Each response supports 32 notifications of up to 128 KiB each, with a 4 MiB total projection budget per repair round.
+
+Republish can recover a lost message only while the server retains it on the same subscription. Monitor item queue overflow separately. After an endpoint restart or certificate cutover, reconnect and reconcile the gap. Use `disconnect().await` to wait for closure. Dropping a stream schedules best-effort cleanup on its creating runtime. [OPC UA Republish](https://reference.opcfoundation.org/specs/OPC-10000-4/5.14.6)
 
 ## Inspect metadata and values
 
-`client.read_attributes` accepts all 27 standard attribute identifiers supported by the backend. Select `DisplayName`, `AccessLevel` and `Historizing` to inspect a variable before reading it. Check each returned status because attributes depend on the node class and the session’s access rights. Typed scalar reads also support ByteString as `Vec<u8>`, Guid as `uuid::Uuid` and DateTime as `time::OffsetDateTime`. Raw reads retain the original Variant for custom types.
+`client.read_attributes` accepts 27 standard node attributes. Select `DisplayName`, `AccessLevel` and `Historizing` to inspect a variable before reading it. Check each returned status because attributes depend on the node class and the session’s access rights. Typed scalar reads also support ByteString as `Vec<u8>`, Guid as `uuid::Uuid` and DateTime as `time::OffsetDateTime`. Raw reads retain the original Variant for custom types.
 
 ## Write a value or call a method
 
@@ -57,9 +59,9 @@ Provision the successor DER leaf independently, verify its host and application 
 
 ## Serve a host-owned variable
 
-Run the local example with `cargo run --locked --no-default-features --features server --example local_server`. Browse the application namespace with a second OPC UA client. Enter a UInt64 on stdin to update the counter. EOF requests shutdown. The loopback endpoint accepts local anonymous reads. Node management and updates belong to the host, and its published variables are read-only to peers.
+Run the local example with `cargo run --locked --no-default-features --features server --example local_server`. Browse the application namespace with a second OPC UA client. Enter a UInt64 on stdin to update the counter. EOF requests shutdown. The loopback endpoint accepts local anonymous reads. Peers can browse, read and monitor the counter. The host controls its value through the typed variable handle.
 
-For an encrypted listener, construct `Server::secure` with a `SecureServerConfig`. Supply an explicit bind address, the server application URI, its DER certificate and private key, and a separately reviewed client application URI and leaf. It serves Basic256Sha256 with SignAndEncrypt. Clients authenticate with their application certificates and use an anonymous user token. Local and secure servers both expose host-owned, read-only variables. Review accepted client identities before changing deployment configuration.
+For an encrypted listener, construct `Server::secure` with a `SecureServerConfig`. Supply an explicit bind address, the server application URI, its DER certificate and private key, and a separately reviewed client application URI and leaf. It serves Basic256Sha256 with SignAndEncrypt. Use `Server::secure_with_policy` to select an AES128 or AES256 RSA policy for the listener. Clients authenticate with their application certificates and use an anonymous user token. Local and secure servers both expose host-owned, read-only variables. Review accepted client identities before changing deployment configuration.
 
 ## Exchange a UADP dataset
 

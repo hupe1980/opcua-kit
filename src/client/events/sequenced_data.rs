@@ -1,14 +1,10 @@
 //! Dedicated multi-node data-change subscription with same-session retransmission.
 use super::{MAX_WAIT, PublishError, Sequenced, publish, wire};
-use crate::client::{
-    ua,
-    wire::{slice, variant_size},
-};
+use crate::client::{ua, wire::variant_size};
 use crate::{
     CertificateRollover, Client, ConnectionConfig, ConnectionOptions, DataChange, MonitoredNode,
     NodeId, RecoveringClient, SubscriptionError,
 };
-use open62541::DataType;
 use std::time::Duration;
 
 /// One dedicated, pinned session for changes from 1–32 ordered variables. This owner
@@ -102,52 +98,17 @@ async fn setup(
     let mut requests = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
         let node = metadata.namespaces.wire_node(node, index)?;
-        let mut item = ua::MonitoredItemCreateRequest::init()
-            .with_node_id(&node)
-            .with_attribute_id(&ua::AttributeId::VALUE)
-            .with_monitoring_mode(&ua::MonitoringMode::REPORTING)
-            .with_sampling_interval(Some(interval))
-            .with_queue_size(32)
-            .with_discard_oldest(true);
-        // SAFETY: item is exclusively owned. Handle zero is reserved.
-        unsafe { item.as_mut() }.requestedParameters.clientHandle = (index + 1) as u32;
-        requests.push(item);
+        requests.push(wire::item(
+            node,
+            13,
+            (index + 1) as u32,
+            interval,
+            Default::default(),
+        ));
     }
-    let (sub, timeout) = wire::create_subscription(client, &mut session, interval).await?;
-    let reply = wire::create_items(client, &mut session, sub, &requests).await?;
-    // SAFETY: the response owns all monitored item results for this scope.
-    let results = unsafe { slice(reply.0.results, reply.0.resultsSize, nodes.len()) }
-        .ok_or(PublishError::InvalidNotification)?;
-    if results.len() != nodes.len() {
-        return Err(PublishError::InvalidNotification);
-    }
-    let mut revisions = Vec::with_capacity(nodes.len());
-    let mut ids = std::collections::BTreeSet::new();
-    for (index, (result, node)) in results.iter().zip(nodes).enumerate() {
-        let status = ua::StatusCode::clone_raw(&result.statusCode);
-        if !status.is_good() {
-            return Err(SubscriptionError::ItemRejected {
-                index,
-                source: open62541::Error::Server(status),
-            }
-            .into());
-        }
-        let revised = Duration::try_from_secs_f64(result.revisedSamplingInterval / 1000.)
-            .map_err(|_| SubscriptionError::ItemRevision { index })?;
-        if result.monitoredItemId == 0
-            || !ids.insert(result.monitoredItemId)
-            || revised > MAX_WAIT
-            || !(2..=32).contains(&result.revisedQueueSize)
-        {
-            return Err(SubscriptionError::ItemRevision { index }.into());
-        }
-        revisions.push(MonitoredNode {
-            node: node.clone(),
-            sampling_interval: revised,
-            queue_size: result.revisedQueueSize,
-        });
-    }
-    Ok((sub, timeout, revisions))
+    let sub = wire::create_subscription(client, &mut session, interval).await?;
+    let results = wire::create_items(client, &mut session, sub.id, requests).await?;
+    Ok((sub.id, sub.timeout_ms, wire::revisions(nodes, &results)?))
 }
 fn decode(
     note: &ua::ExtensionObject,
@@ -156,30 +117,26 @@ fn decode(
     values: &mut Vec<DataChange>,
 ) -> Result<(), PublishError> {
     let list = note
-        .decoded_content::<wire::DataChangeList>()
+        .inner_as::<ua::DataChangeNotification>()
         .ok_or(PublishError::InvalidNotification)?;
-    let changes = unsafe {
-        slice(
-            list.0.monitoredItems,
-            list.0.monitoredItemsSize,
-            32 - values.len(),
-        )
+    let changes = list.monitored_items.as_deref().unwrap_or_default();
+    if changes.len() > 32 - values.len() {
+        return Err(PublishError::InvalidNotification);
     }
-    .ok_or(PublishError::InvalidNotification)?;
     for change in changes {
         let index = change
-            .clientHandle
+            .client_handle
             .checked_sub(1)
             .ok_or(PublishError::InvalidNotification)? as usize;
         if index >= count {
             return Err(PublishError::InvalidNotification);
         }
-        let raw = ua::DataValue::raw_ref(&change.value);
-        let status = raw.status().map_or(0, DataType::into_raw);
+        let raw = &change.value;
+        let status = raw.status.unwrap_or_default().bits();
         if status & 0x0c80 == 0x0480 {
             return Err(SubscriptionError::ItemOverflow { index, status }.into());
         }
-        if let Some(value) = raw.value() {
+        if let Some(value) = &raw.value {
             let bytes = variant_size(value)
                 .filter(|n| *n <= 128 * 1024)
                 .ok_or(SubscriptionError::ItemValueLimit { index })?;
@@ -189,7 +146,7 @@ fn decode(
         }
         values.push(DataChange {
             index,
-            value: raw.clone().cast(),
+            value: raw.clone(),
         });
     }
     Ok(())

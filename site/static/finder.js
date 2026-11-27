@@ -4,6 +4,7 @@ const results = document.querySelector("#results");
 
 function filterGuides() {
   const query = field.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  document.querySelector(".group-links").hidden = query.length > 0;
   let total = 0;
   for (const section of sections) {
     let visible = 0;

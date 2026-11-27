@@ -2,7 +2,7 @@
 default:
     @just --list
 
-# Build the library with its default client feature.
+# Build the library with its Rust discovery and PubSub features.
 build:
     cargo build --locked
 

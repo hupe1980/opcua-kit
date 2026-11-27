@@ -28,7 +28,7 @@ A contract contains a version, scope and required signals. Each signal has a nam
 }
 ```
 
-A snapshot uses the same scope and identity fields. An observed attribute carries its raw UInt32 operation status. A Good-severity result includes the value when one was returned. A completed operation with no usable value, including Good, carries only its status. An attribute with no observation is omitted. Explicit JSON null is invalid. Assessment marks unavailable evidence unverified. The checker rejects unknown fields, duplicate identities, scope changes and unsupported versions. The contract accepts up to 1,024 signals; each input document is limited to 4 MiB. Keep evidence files in a trusted store.
+A snapshot uses the same scope and identity fields. An observed attribute carries its raw UInt32 operation status. A Good-severity result includes the value when one was returned. A completed operation with no usable value, including Good, carries only its status. An attribute with no observation is omitted. Explicit JSON null is invalid. Assessment marks unavailable evidence unverified. The checker rejects unknown fields, duplicate identities, scope changes and unsupported versions. A contract accepts up to 1,024 signals. Each input document is limited to 4 MiB. Keep evidence files in a trusted store.
 
 Validate contract edits offline with `opcua-kit contract validate --contract plant.json`. For an example that starts with a known device configuration, see the [contract authoring guide](@/authoring.md).
 
@@ -36,7 +36,7 @@ Validate contract edits offline with `opcua-kit contract validate --contract pla
 
 The example requires degrees Celsius (CEL, 4408652). Degrees Fahrenheit (FAH, 4604232) would produce a mismatch even if the signal still declares Double. Omit `engineeringUnits` to skip this property. Use the exact, case-sensitive defining namespace URI and signed Int32 identifier from the device model. Custom unit authorities are supported. Localized labels never participate in equality.
 
-A captured unit with a blank defining URI or unitId -1 remains unverified even with a Good status. A non-Good result retains the raw status and omits the value. An unknown signal namespace leaves the observation absent. All three cases count toward incomplete evidence. A service-level failure or an invalid property response prevents capture from replacing the snapshot. [OPC UA definition](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.3) · [UN/CEFACT mapping](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.4)
+A captured unit with a blank defining URI or unitId -1 remains unverified even with a Good status. An Uncertain or Bad result retains its raw status and omits the value. An unknown signal namespace leaves the observation absent. All three cases count toward incomplete evidence. A service-level failure or an invalid property response prevents capture from replacing the snapshot. [OPC UA definition](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.3) · [UN/CEFACT mapping](https://reference.opcfoundation.org/specs/OPC-10000-8/5.6.4.4)
 
 ### Reproduce incomplete evidence
 
@@ -95,4 +95,4 @@ Save the report as a CI artifact on exits 0, 2 and 3. Exit 1 writes a diagnostic
 
 ## Use the Rust API
 
-For an offline checker, run `cargo add opcua-kit --no-default-features --features commissioning` in your application directory. Omit `--no-default-features` if the application also connects to devices. Pass JSON bytes to `parse_contract` and `parse_snapshot`, then call `assess` with one snapshot or `compare` with the baseline and current snapshots. `Report::exit_code` gives the CLI decision. Run `cargo doc -p opcua-kit --open` to browse the types.
+For an offline checker, run `cargo add opcua-kit --no-default-features --features commissioning` in your application directory. Add `client` to the feature list for authenticated device sessions. Pass JSON bytes to `parse_contract` and `parse_snapshot`, then call `assess` with one snapshot or `compare` with the baseline and current snapshots. `Report::exit_code` gives the CLI decision. Run `cargo doc -p opcua-kit --open` to browse the types.

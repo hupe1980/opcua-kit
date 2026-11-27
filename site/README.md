@@ -1,15 +1,7 @@
-# opcua-kit website
+# Build the documentation site
 
-The landing page and documentation build with Zola 0.23.6. From the source checkout’s `site/` directory, run `zola serve` and open the local address it prints. To generate the production site and check its Markdown links, rendered navigation and search metadata, run the following commands.
+From the repository root, run `just site-serve` to preview changes with live reload. Run `just site` to build the production site and check links, heading anchors and search metadata. These recipes use Zola 0.23.6 and Python 3.11 or newer.
 
-```sh
-zola check --skip-external-links
-zola build
-python3 check_output.py
-```
+Write guides in `site/content/`. Give each one a unique title, description and weight. Set `extra.group` to a category from `config.toml` and use `extra.keywords` for searchable service and API names. Link between guides with Zola’s `@/filename.md` syntax.
 
-Edit guides in `content/`. Each guide has a title, a description, a unique weight for ordering, an `extra.group` from `config.toml` and `extra.keywords` for searchable API names. The documentation index, filter and sidebar use that metadata. Link to guides with Zola’s `@/filename.md` syntax so links work under the repository base path.
-
-The landing layout lives in `templates/index.html`. Shared navigation and search metadata live in `templates/base.html`. The styles, font and artwork are served locally from `static/`.
-
-The output checker uses Python 3.11 or newer. The build writes to `public/`. Select **GitHub Actions** as the repository’s Pages source. The **Site** workflow checks pull requests and deploys validated site changes on `main`. Run it manually on `main` to redeploy.
+The landing page and guide directory use templates in `site/templates/`. Artwork, fonts, styles and the guide filter are served from `site/static/`. The GitHub Pages workflow publishes the validated `site/public/` build on changes to the site on `main`.

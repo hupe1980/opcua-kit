@@ -17,7 +17,8 @@ async def run(binary):
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         certificate(directory, "client", uri="urn:fixture:client")
-        certificate(directory, "server")
+        # Exercise the additional OPC UA asymmetric padding byte with unequal key sizes.
+        certificate(directory, "server", key_bits=3072)
         users = Readers()
         server = Server(user_manager=users)
         await server.init()

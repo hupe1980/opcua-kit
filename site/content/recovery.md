@@ -11,6 +11,17 @@ A restarted server can assign new namespace indexes and lose its subscriptions. 
 
 ## Choose the endpoint and account
 
+Endpoint discovery uses the Rust implementation included in the default build.
+
+```rust
+use opcua_kit::{discover_endpoints, DiscoveryError, EndpointInfo};
+use std::time::Duration;
+
+fn endpoints(url: &str) -> Result<Vec<EndpointInfo>, DiscoveryError> {
+    discover_endpoints(url, Duration::from_secs(5))
+}
+```
+
 Run discovery on the operator’s explicit OPC TCP address. It uses a discovery channel without opening a user session. The returned URLs, security policies, application URIs, and user-token policies are advertised information. Verify the selected server’s identity and certificate through the site’s trust process.
 
 ```sh
@@ -26,7 +37,7 @@ opcua-kit browse --endpoint opc.tcp://plc.example:4840 --server-uri urn:plant:pl
   --security-policy Aes256_Sha256_RsaPss --namespace http://opcfoundation.org/UA/ --id i=85
 ```
 
-`Client::connect_with` accepts `ConnectionOptions` for the same policy and user choices. The supported RSA channel policies are Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, all with SignAndEncrypt. A failed policy, pin or user check fails the connection. A native contract for this example uses `"principal":"username:plant-reader"`. The client certificate identifies the application independently of the user. [OPC UA GetEndpoints](https://reference.opcfoundation.org/specs/OPC-10000-4/5.5.4)
+`Client::connect_with` accepts `ConnectionOptions` for the same policy and user choices. The supported RSA channel policies are Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, all with SignAndEncrypt. A failed policy, pin or user check fails the connection. A commissioning contract for this account uses `"principal":"username:plant-reader"`. The client certificate identifies the application independently of the user. [OPC UA GetEndpoints](https://reference.opcfoundation.org/specs/OPC-10000-4/5.5.4)
 
 ## Resume polling after a PLC restart
 
@@ -78,4 +89,4 @@ History samples carry the server’s raw values and clocks. When units or sensor
 
 ## Read part of an array
 
-`read_array::<T>` retains OPC UA row-major dimensions and elements for Boolean and fixed-width numeric types. For example, `client.read_array_range::<f64>(&node, &[0..=2, 4..=7]).await?` sends the range `0:2,4:7` for a matrix. Each result retains its status and independent clocks. The client limits each projection to 65,536 elements and 16 dimensions. SDK response decoding precedes those application limits.
+`read_array::<T>` retains OPC UA row-major dimensions and elements for Boolean and fixed-width numeric types. For example, `client.read_array_range::<f64>(&node, &[0..=2, 4..=7]).await?` sends the range `0:2,4:7` for a matrix. Each result retains its status and independent clocks. The client limits each projection to 65,536 elements and 16 dimensions. UA Binary decoding precedes those application limits.

@@ -2,14 +2,13 @@
 mod publish;
 mod sequenced_data;
 pub use sequenced_data::SequencedDataChanges;
-mod wire;
-use super::wire::slice;
+pub(super) mod wire;
+use super::ua;
 use super::{
     BrowseName, CertificateRollover, Client, ConnectionConfig, ConnectionOptions, ReadError,
     RecoveringClient, RecoveryError, SubscriptionError,
 };
 use crate::NodeId;
-use open62541::{DataType, ua};
 pub use publish::Sequenced;
 use std::time::Duration;
 
@@ -96,27 +95,29 @@ fn selected_values<'a>(
     mut fields: impl Iterator<Item = &'a ua::Variant> + Clone,
 ) -> Result<Vec<ua::Variant>, EventError> {
     let all = fields.clone();
-    let ty = fields
-        .next()
-        .and_then(ua::Variant::as_scalar::<ua::NodeId>)
-        .filter(|node| !node.is_null())
-        .ok_or(EventError::InvalidNotification)?;
-    if ty.as_ns0() == Some(OVERFLOW_EVENT) {
-        return Err(EventError::ServerOverflow);
-    }
-    // Part 5 §6.4.34 makes EventQueueOverflowEventType abstract. Its concrete
-    // subtypes report this standard source, regardless of the subtype namespace.
-    let source_node = fields.next().ok_or(EventError::InvalidNotification)?;
-    let source_name = fields.next().ok_or(EventError::InvalidNotification)?;
-    let node = source_node.as_scalar::<ua::NodeId>();
-    let name = source_name.as_scalar::<ua::String>();
-    if (!source_node.is_empty() && node.is_none()) || (!source_name.is_empty() && name.is_none()) {
+    let Some(ua::Variant::NodeId(ty)) = fields.next() else {
+        return Err(EventError::InvalidNotification);
+    };
+    if ty.is_null() {
         return Err(EventError::InvalidNotification);
     }
-    if node.and_then(ua::NodeId::as_ns0) == Some(open62541_sys::UA_NS0ID_SERVER)
-        && name.and_then(ua::String::as_str) == Some("Internal/EventQueueOverflow")
-    {
+    if **ty == ua::NodeId::new(0, OVERFLOW_EVENT) {
         return Err(EventError::ServerOverflow);
+    }
+    // Part 5 §6.4.34 assigns this source to concrete overflow event subtypes.
+    let server = match fields.next() {
+        Some(ua::Variant::NodeId(node)) => **node == ua::NodeId::new(0, 2253),
+        Some(ua::Variant::Empty) => false,
+        _ => return Err(EventError::InvalidNotification),
+    };
+    match fields.next() {
+        Some(ua::Variant::String(name))
+            if server && name.as_ref() == "Internal/EventQueueOverflow" =>
+        {
+            return Err(EventError::ServerOverflow);
+        }
+        Some(ua::Variant::String(_) | ua::Variant::Empty) => (),
+        _ => return Err(EventError::InvalidNotification),
     }
     let mut left = 128 * 1024usize;
     for field in all {
@@ -234,11 +235,11 @@ impl Events {
         let node = ns.wire_node(notifier, 0)?;
         let mut clauses: Vec<_> = INTERNAL_FIELDS
             .iter()
-            .map(|&name| {
-                ua::SimpleAttributeOperand::init()
-                    .with_type_definition_id(ua::NodeId::ns0(2041))
-                    .with_browse_path(&[ua::QualifiedName::ns0(name)])
-                    .with_attribute_id(&ua::AttributeId::VALUE)
+            .map(|&name| ua::SimpleAttributeOperand {
+                type_definition_id: ua::NodeId::new(0, 2041),
+                browse_path: Some(vec![ua::QualifiedName::new(0, name)]),
+                attribute_id: 13,
+                ..Default::default()
             })
             .collect();
         for (index, field) in fields.iter().enumerate() {
@@ -251,51 +252,33 @@ impl Events {
                         .by_uri
                         .get(name.namespace.as_str())
                         .ok_or(ReadError::UnknownNamespace { index })?;
-                    Ok::<_, ReadError>(ua::QualifiedName::new(*ns_index, &name.name))
+                    Ok::<_, ReadError>(ua::QualifiedName::new(*ns_index, name.name.as_str()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let attribute = if path.is_empty() {
-                ua::AttributeId::NODEID
-            } else {
-                ua::AttributeId::VALUE
-            };
-            clauses.push(
-                ua::SimpleAttributeOperand::init()
-                    .with_type_definition_id(ty)
-                    .with_browse_path(&path)
-                    .with_attribute_id(&attribute),
-            );
+            clauses.push(ua::SimpleAttributeOperand {
+                type_definition_id: ty,
+                attribute_id: if path.is_empty() { 1 } else { 13 },
+                browse_path: Some(path),
+                ..Default::default()
+            });
         }
-        let (subscription, timeout_ms) =
-            wire::create_subscription(client, &mut session, interval).await?;
-        let mut item = ua::MonitoredItemCreateRequest::init()
-            .with_node_id(&node)
-            .with_attribute_id(&ua::AttributeId::EVENTNOTIFIER)
-            .with_monitoring_mode(&ua::MonitoringMode::REPORTING)
-            .with_sampling_interval(Some(Duration::ZERO))
-            .with_queue_size(32)
-            .with_discard_oldest(true)
-            .with_filter(&ua::EventFilter::init().with_select_clauses(&clauses));
-        // SAFETY: we own the initialized item. The handle identifies this single notifier on Publish.
-        unsafe { item.as_mut() }.requestedParameters.clientHandle = 1;
-        let resp = wire::create_items(client, &mut session, subscription, &[item]).await?;
-        // SAFETY: the SDK response owns these decoded result arrays for this scope.
-        let [result] = (unsafe { slice(resp.0.results, resp.0.resultsSize, 1) })
-            .ok_or(EventError::InvalidNotification)?
-        else {
-            return Err(EventError::InvalidNotification);
-        };
-        if result.statusCode >> 30 != 0 {
-            return Err(EventError::Status(result.statusCode));
+        let count = clauses.len();
+        let subscription = wire::create_subscription(client, &mut session, interval).await?;
+        let filter = ua::ExtensionObject::new(ua::EventFilter {
+            select_clauses: Some(clauses),
+            ..Default::default()
+        });
+        let item = wire::item(node, 12, 1, Duration::ZERO, filter);
+        let results = wire::create_items(client, &mut session, subscription.id, vec![item]).await?;
+        let result = &results[0];
+        if !result.status_code.is_good() {
+            return Err(EventError::Status(result.status_code.bits()));
         }
-        if result.monitoredItemId == 0 || !(1..=32).contains(&result.revisedQueueSize) {
+        if result.monitored_item_id == 0 || !(1..=32).contains(&result.revised_queue_size) {
             return Err(SubscriptionError::InvalidRevision.into());
         }
-        validate_filter(
-            ua::ExtensionObject::raw_ref(&result.filterResult),
-            clauses.len(),
-        )?;
-        Ok((subscription, timeout_ms))
+        validate_filter(&result.filter_result, count)?;
+        Ok((subscription.id, subscription.timeout_ms))
     }
 
     /// Wait for the next ordered event. Eligible retained messages are recovered via Republish.
@@ -318,26 +301,18 @@ impl Events {
 }
 
 fn validate_filter(filter: &ua::ExtensionObject, count: usize) -> Result<(), EventError> {
-    if let Some(filter) = filter.decoded_content::<wire::FilterResult>() {
-        let statuses = unsafe {
-            slice(
-                filter.0.selectClauseResults,
-                filter.0.selectClauseResultsSize,
-                count,
-            )
-        }
+    if filter.is_null() {
+        return Ok(());
+    }
+    let result = filter
+        .inner_as::<ua::EventFilterResult>()
         .ok_or(EventError::InvalidNotification)?;
-        if !statuses.is_empty() && statuses.len() != count {
-            return Err(EventError::InvalidNotification);
-        }
-        if let Some(status) = statuses.iter().find(|s| **s >> 30 != 0) {
-            return Err(EventError::Status(*status));
-        }
-    } else if unsafe { filter.as_ref() }.encoding
-        != open62541_sys::UA_ExtensionObjectEncoding::UA_EXTENSIONOBJECT_ENCODED_NOBODY
-        || !filter.encoded_type_id().is_some_and(ua::NodeId::is_null)
-    {
+    let statuses = result.select_clause_results.as_deref().unwrap_or_default();
+    if !statuses.is_empty() && statuses.len() != count {
         return Err(EventError::InvalidNotification);
+    }
+    if let Some(s) = statuses.iter().find(|s| !s.is_good()) {
+        return Err(EventError::Status(s.bits()));
     }
     Ok(())
 }
@@ -350,23 +325,18 @@ fn decode_events(
 ) -> Result<(), EventError> {
     let invalid = || EventError::InvalidNotification;
     let list = note
-        .decoded_content::<wire::EventList>()
+        .inner_as::<ua::EventNotificationList>()
         .ok_or_else(invalid)?;
-    for event in
-        unsafe { slice(list.0.events, list.0.eventsSize, 32 - events.len()) }.ok_or_else(invalid)?
-    {
-        if event.clientHandle != 1 || event.eventFieldsSize != count + INTERNAL_FIELDS.len() {
+    let rows = list.events.as_deref().unwrap_or_default();
+    if rows.len() > 32 - events.len() {
+        return Err(invalid());
+    }
+    for event in rows {
+        let fields = event.event_fields.as_deref().unwrap_or_default();
+        if event.client_handle != 1 || fields.len() != count + INTERNAL_FIELDS.len() {
             return Err(invalid());
         }
-        let raw = unsafe {
-            slice(
-                event.eventFields,
-                event.eventFieldsSize,
-                32 + INTERNAL_FIELDS.len(),
-            )
-        }
-        .ok_or_else(invalid)?;
-        let values = raw.iter().map(ua::Variant::raw_ref);
+        let values = fields.iter();
         for value in values.clone() {
             *budget = budget
                 .checked_sub(super::wire::variant_size(value).ok_or_else(invalid)?)
@@ -383,8 +353,8 @@ mod tests {
 
     #[test]
     fn unexpected_filter_result_type_is_rejected() {
-        assert!(validate_filter(&ua::ExtensionObject::init(), 1).is_ok());
-        let other = ua::ExtensionObject::new(&ua::UInt32::new(1));
+        assert!(validate_filter(&ua::ExtensionObject::default(), 1).is_ok());
+        let other = ua::ExtensionObject::new(ua::EventFilter::default());
         assert!(matches!(
             validate_filter(&other, 1),
             Err(EventError::InvalidNotification)
@@ -393,11 +363,11 @@ mod tests {
 
     #[test]
     fn concrete_overflow_uses_both_standard_source_fields() {
-        let ty = ua::Variant::scalar(ua::NodeId::numeric(2, 2000));
-        let server = ua::Variant::scalar(ua::NodeId::ns0(open62541_sys::UA_NS0ID_SERVER));
-        let other = ua::Variant::scalar(ua::NodeId::numeric(2, 2001));
-        let name = ua::Variant::scalar(ua::String::new("Internal/EventQueueOverflow").unwrap());
-        let absent = ua::Variant::init();
+        let ty = ua::Variant::from(ua::NodeId::new(2, 2000));
+        let server = ua::Variant::from(ua::NodeId::new(0, 2253));
+        let other = ua::Variant::from(ua::NodeId::new(2, 2001));
+        let name = ua::Variant::from("Internal/EventQueueOverflow");
+        let absent = ua::Variant::Empty;
         assert!(matches!(
             selected_values([&ty, &server, &name].into_iter()),
             Err(EventError::ServerOverflow)
@@ -420,15 +390,15 @@ mod tests {
 
     #[test]
     fn event_type_and_exact_aggregate_budget_are_checked_before_copying_fields() {
-        let ty = ua::Variant::scalar(ua::NodeId::ns0(2041));
-        let source = ua::Variant::scalar(ua::NodeId::ns0(open62541_sys::UA_NS0ID_SERVER));
-        let name = ua::Variant::scalar(ua::String::new("Server").unwrap());
+        let ty = ua::Variant::from(ua::NodeId::new(0, 2041));
+        let source = ua::Variant::from(ua::NodeId::new(0, 2253));
+        let name = ua::Variant::from("Server");
         let hidden_bytes = [&ty, &source, &name]
             .iter()
             .map(|field| super::super::wire::variant_size(field).unwrap())
             .sum::<usize>();
         let capacity = 128 * 1024 - hidden_bytes - 5;
-        let value = |size| ua::Variant::scalar(ua::ByteString::new(&vec![0; size]));
+        let value = |size| ua::Variant::ByteString(vec![0; size].into());
         assert_eq!(
             selected_values([&ty, &source, &name, &value(capacity)].into_iter())
                 .unwrap()
@@ -440,11 +410,11 @@ mod tests {
             Err(EventError::InvalidNotification)
         ));
         assert!(matches!(
-            selected_values([&ua::Variant::scalar(ua::NodeId::ns0(0))].into_iter()),
+            selected_values([&ua::Variant::from(ua::NodeId::new(0, 0))].into_iter()),
             Err(EventError::InvalidNotification)
         ));
         assert!(matches!(
-            selected_values([&ua::Variant::scalar(ua::NodeId::ns0(3035))].into_iter()),
+            selected_values([&ua::Variant::from(ua::NodeId::new(0, 3035))].into_iter()),
             Err(EventError::ServerOverflow)
         ));
     }

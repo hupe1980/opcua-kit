@@ -66,8 +66,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for item in initial {
         assert_eq!(item?.value, Some(111));
     }
+    println!("TEST ready");
+    wait_for("renewed")?;
     let same = owner.session().await?;
     assert_eq!((same.generation, same.state), (1, SessionState::Continuing));
+    assert_eq!(
+        same.client.read_scalar::<u64>(&signal).await?.value,
+        Some(111)
+    );
     let clock = NodeId::new("http://opcfoundation.org/UA/", "i=2257")?;
     let mut group = same
         .client

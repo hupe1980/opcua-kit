@@ -1,8 +1,6 @@
 //! One outstanding Publish on a dedicated session, with bounded in-order same-session recovery.
 use super::{EventError, MAX_WAIT, wire};
-use crate::client::{Client, ReadError, SubscriptionError, ua, wire::slice};
-use open62541::DataType;
-use open62541_sys::UA_NotificationMessage;
+use crate::client::{Client, ReadError, SubscriptionError, ua};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 
@@ -123,7 +121,7 @@ impl<T: Send + 'static> Drop for Stream<T> {
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
             // Closing the authenticated session also deletes its server subscription. Keep the
-            // SDK alive until the outstanding service future releases its last Arc.
+            // session alive until the outstanding service future releases its last Arc.
             self.runtime.spawn(close(client, self.request.take()));
         }
     }
@@ -158,11 +156,18 @@ async fn round<T: Send>(
     previous: Vec<u32>,
 ) -> Result<Round<T>, EventError> {
     drop(client.read_session().await?);
-    let request = wire::publish(sub, &previous, timeout).ok_or(EventError::InvalidNotification)?;
+    let acks = previous
+        .iter()
+        .map(|&sequence_number| ua::SubscriptionAcknowledgement {
+            subscription_id: sub,
+            sequence_number,
+        })
+        .collect();
+    let request = wire::publish(acks, timeout);
     // Publish carries only this dedicated subscription ID. Leave the session lock free while
     // waiting so ConditionRefresh can run on the same authenticated session. Check retirement
     // on both sides of the wait and retire the session on an unconfirmed service failure.
-    let response = client.inner.service_request(request).await;
+    let response = client.inner.request(request).await;
     let mut session = client.reads.lock().await;
     client.check_channel()?;
     if session.interrupted {
@@ -172,30 +177,31 @@ async fn round<T: Send>(
         session.interrupted = true;
         ReadError::Service(e)
     })?;
-    if reply.0.subscriptionId != sub || reply.0.resultsSize != previous.len() {
+    let statuses = reply.results.as_deref().unwrap_or_default();
+    if reply.subscription_id != sub || statuses.len() != previous.len() {
         return Err(EventError::InvalidNotification);
     }
-    // SAFETY: the SDK owns the decoded arrays through this response.
-    let statuses = unsafe { slice(reply.0.results, reply.0.resultsSize, MAX_MISSING + 1) }
-        .ok_or(EventError::InvalidNotification)?;
-    if let Some(&status) = statuses.iter().find(|s| **s >> 30 != 0) {
-        return Err(EventError::Status(status));
+    if let Some(status) = statuses.iter().find(|s| !s.is_good()) {
+        return Err(EventError::Status(status.bits()));
     }
-    let available = unsafe {
-        slice(
-            reply.0.availableSequenceNumbers,
-            reply.0.availableSequenceNumbersSize,
-            4096,
-        )
+    let available = reply
+        .available_sequence_numbers
+        .as_deref()
+        .unwrap_or_default();
+    if available.len() > 4096 {
+        return Err(EventError::InvalidNotification);
     }
-    .ok_or(EventError::InvalidNotification)?;
-    let actual = reply.0.notificationMessage.sequenceNumber;
+    let actual = reply.notification_message.sequence_number;
     let needed = missing(expected, actual, available)?;
-    let ack_current =
-        available.contains(&actual) && reply.0.notificationMessage.notificationDataSize > 0;
+    let ack_current = available.contains(&actual)
+        && reply
+            .notification_message
+            .notification_data
+            .as_ref()
+            .is_some_and(|notes| !notes.is_empty());
     let mut budget = MAX_ROUND_BYTES;
     let live = message(
-        &reply.0.notificationMessage,
+        &reply.notification_message,
         count,
         decode,
         false,
@@ -210,19 +216,21 @@ async fn round<T: Send>(
     let mut values = VecDeque::new();
     let mut acks = Vec::with_capacity(needed.len() + 1);
     for seq in needed {
-        let mut request = wire::Republish::init();
-        request.0.subscriptionId = sub;
-        request.0.retransmitSequenceNumber = seq;
+        let request = ua::RepublishRequest {
+            subscription_id: sub,
+            retransmit_sequence_number: seq,
+            ..Default::default()
+        };
         let reply = client
-            .guarded(&mut session, client.inner.service_request(request))
+            .guarded(&mut session, client.inner.request(request))
             .await
             .map_err(|err| match &err {
                 ReadError::Service(error)
                     if [
-                        ua::StatusCode::BADMESSAGENOTAVAILABLE,
-                        ua::StatusCode::BADSEQUENCENUMBERUNKNOWN,
+                        ua::StatusCode::BadMessageNotAvailable,
+                        ua::StatusCode::BadSequenceNumberUnknown,
                     ]
-                    .contains(&error.status_code()) =>
+                    .contains(error) =>
                 {
                     EventError::SequenceGap {
                         expected: seq,
@@ -231,8 +239,12 @@ async fn round<T: Send>(
                 }
                 _ => err.into(),
             })?;
-        if reply.0.notificationMessage.sequenceNumber != seq
-            || reply.0.notificationMessage.notificationDataSize == 0
+        if reply.notification_message.sequence_number != seq
+            || reply
+                .notification_message
+                .notification_data
+                .as_ref()
+                .is_none_or(Vec::is_empty)
         {
             return Err(EventError::SequenceGap {
                 expected: seq,
@@ -240,7 +252,7 @@ async fn round<T: Send>(
             });
         }
         values.extend(message(
-            &reply.0.notificationMessage,
+            &reply.notification_message,
             count,
             decode,
             true,
@@ -260,19 +272,20 @@ async fn round<T: Send>(
 }
 
 fn message<T>(
-    m: &UA_NotificationMessage,
+    m: &ua::NotificationMessage,
     count: usize,
     decode: Decode<T>,
     republished: bool,
     budget: &mut usize,
 ) -> Result<Vec<Sequenced<T>>, EventError> {
-    let notes = unsafe { slice(m.notificationData, m.notificationDataSize, 32) }
-        .ok_or(EventError::InvalidNotification)?;
+    let notes = m.notification_data.as_deref().unwrap_or_default();
+    if notes.len() > 32 {
+        return Err(EventError::InvalidNotification);
+    }
     let mut values = Vec::new();
     for note in notes {
-        let note = ua::ExtensionObject::raw_ref(note);
-        if let Some(status) = note.decoded_content::<wire::StatusChange>() {
-            return Err(EventError::Status(status.0.status));
+        if let Some(status) = note.inner_as::<ua::StatusChangeNotification>() {
+            return Err(EventError::Status(status.status.bits()));
         }
         decode(note, count, budget, &mut values)?;
     }
@@ -282,7 +295,7 @@ fn message<T>(
     Ok(values
         .into_iter()
         .map(|value| Sequenced {
-            sequence: m.sequenceNumber,
+            sequence: m.sequence_number,
             republished,
             value,
         })

@@ -6,11 +6,12 @@ use std::time::Duration;
 use clap::{Args, ValueEnum};
 use opcua_kit::commissioning::{Contract, Snapshot};
 use opcua_kit::{
-    Client, ConnectionConfig, ConnectionOptions, NodeId, Sample, SampleTimestamp, SecurityPolicy,
-    UserIdentity, VariableDefinition,
+    Client, ConnectError, ConnectionConfig, ConnectionOptions, NodeId, Sample, SampleTimestamp,
+    SecurityPolicy, UserIdentity, VariableDefinition, certificate_application_uri,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use zeroize::Zeroizing;
 
 use super::{Connection, Result, write_compact_line};
 
@@ -54,53 +55,62 @@ impl From<Policy> for SecurityPolicy {
     }
 }
 
-#[derive(Clone, Args)]
-pub(super) struct SessionArgs {
-    /// Exact native policy (default Basic256Sha256). The channel always signs and encrypts.
-    #[arg(long, value_enum, requires = "client_uri")]
+#[derive(Args)]
+pub(super) struct Credentials {
+    /// Channel policy (default Basic256Sha256). All sessions sign and encrypt.
+    #[arg(long, value_enum)]
     security_policy: Option<Policy>,
     /// Site account for named-user authentication. Defaults to anonymous.
-    #[arg(long, requires_all=["client_uri","password_file"])]
+    #[arg(long, requires = "password_file")]
     username: Option<String>,
     /// UTF-8 password file. One terminal newline is removed.
     #[arg(long, requires = "username")]
     pub(super) password_file: Option<PathBuf>,
-}
-impl SessionArgs {
-    fn principal(&self) -> String {
-        self.username
-            .as_ref()
-            .map_or_else(|| "anonymous".to_owned(), |n| format!("username:{n}"))
-    }
-}
-
-#[derive(Args)]
-struct Credentials {
-    #[command(flatten)]
-    session: SessionArgs,
-    /// Pinned server leaf certificate in DER format.
-    #[arg(long, value_name = "DER_FILE")]
-    server_cert: PathBuf,
-    /// Application URI in the client certificate.
+    /// Pinned server leaf certificate in PEM or DER format.
+    #[arg(long, value_name = "FILE")]
+    pub(super) server_cert: PathBuf,
+    /// Expected client application URI. Defaults to the URI in the client certificate.
     #[arg(long, value_name = "URI")]
-    client_uri: String,
-    /// Client application certificate in DER format.
-    #[arg(long, value_name = "DER_FILE")]
-    client_cert: PathBuf,
-    /// Unencrypted DER private key matching the client certificate.
-    #[arg(long, value_name = "DER_FILE")]
-    client_key: PathBuf,
+    client_uri: Option<String>,
+    /// Client application certificate in PEM or DER format.
+    #[arg(long, value_name = "FILE")]
+    pub(super) client_cert: PathBuf,
+    /// Matching unencrypted PKCS#8 or PKCS#1 RSA private key in PEM or DER format.
+    #[arg(long, value_name = "FILE")]
+    pub(super) client_key: PathBuf,
 }
 
 impl Credentials {
-    fn connect(&self, endpoint: &str, server_uri: &str, timeout: Duration) -> Result<Client> {
+    fn check_principal(&self, contract: &Contract) -> Result<()> {
+        let principal = self
+            .username
+            .as_ref()
+            .map_or_else(|| "anonymous".to_owned(), |u| format!("username:{u}"));
+        if contract.principal() != principal {
+            return Err(
+                "contract principal differs from the selected session user (default anonymous)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn with_config<T>(
+        &self,
+        endpoint: &str,
+        server_uri: &str,
+        timeout: Duration,
+        operation: impl FnOnce(
+            ConnectionConfig<'_>,
+            ConnectionOptions<'_>,
+        ) -> std::result::Result<T, ConnectError>,
+    ) -> Result<T> {
         let secret = self
-            .session
             .password_file
             .as_ref()
             .map(|p| read_credential(p, "--password-file"))
             .transpose()?;
-        let user_identity = match (&self.session.username, secret.as_deref()) {
+        let user_identity = match (&self.username, secret.as_deref()) {
             (None, None) => UserIdentity::Anonymous,
             (Some(username), Some(bytes)) => {
                 let bytes = bytes
@@ -115,35 +125,60 @@ impl Credentials {
             }
             _ => return Err("--username and --password-file must be supplied together".into()),
         };
-        Ok(Client::connect_with(
+        let server = read_der(&self.server_cert, "--server-cert", &["CERTIFICATE"])?;
+        let client = read_der(&self.client_cert, "--client-cert", &["CERTIFICATE"])?;
+        let key = read_der(
+            &self.client_key,
+            "--client-key",
+            &["PRIVATE KEY", "RSA PRIVATE KEY"],
+        )?;
+        let client_uri = match &self.client_uri {
+            Some(uri) => uri,
+            None => certificate_application_uri(&client)?,
+        };
+        Ok(operation(
             ConnectionConfig {
                 endpoint,
                 server_application_uri: server_uri,
-                server_certificate_der: &read_credential(&self.server_cert, "--server-cert")?,
-                client_application_uri: &self.client_uri,
-                client_certificate_der: &read_credential(&self.client_cert, "--client-cert")?,
-                client_private_key_der: &read_credential(&self.client_key, "--client-key")?,
+                server_certificate_der: &server,
+                client_application_uri: client_uri,
+                client_certificate_der: &client,
+                client_private_key_der: &key,
                 timeout,
             },
             ConnectionOptions {
                 user_identity,
-                security_policy: self
-                    .session
-                    .security_policy
-                    .map(Into::into)
-                    .unwrap_or_default(),
+                security_policy: self.security_policy.map(Into::into).unwrap_or_default(),
             },
         )?)
     }
 }
 
-fn read_credential(path: &Path, option: &str) -> Result<Vec<u8>> {
+fn read_der(path: &Path, option: &str, labels: &[&str]) -> Result<Zeroizing<Vec<u8>>> {
+    let bytes = read_credential(path, option)?;
+    if !bytes.trim_ascii_start().starts_with(b"-----BEGIN ") {
+        return Ok(bytes);
+    }
+    let (label, decoded) = pem_rfc7468::decode_vec(bytes.trim_ascii())
+        .map_err(|_| format!("{option}: expected one PEM-encoded credential"))?;
+    let decoded = Zeroizing::new(decoded);
+    if !labels.contains(&label) {
+        return Err(format!(
+            "{option}: unexpected PEM type; expected {}",
+            labels.join(" or ")
+        )
+        .into());
+    }
+    Ok(decoded)
+}
+
+fn read_credential(path: &Path, option: &str) -> Result<Zeroizing<Vec<u8>>> {
     let limit = if option == "--password-file" {
         4098u64
     } else {
         64 * 1024
     };
-    let read_file = || -> io::Result<Vec<u8>> {
+    let read_file = || -> io::Result<Zeroizing<Vec<u8>>> {
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -162,7 +197,7 @@ fn read_credential(path: &Path, option: &str) -> Result<Vec<u8>> {
                 "expected a regular file within the credential size limit",
             ));
         }
-        let mut bytes = Vec::new();
+        let mut bytes = Zeroizing::new(Vec::new());
         file.take(limit + 1).read_to_end(&mut bytes)?;
         if bytes.is_empty() || bytes.len() as u64 > limit {
             return Err(io::Error::other("empty or oversized credential file"));
@@ -231,10 +266,11 @@ impl Operation {
 pub(super) fn run(args: NodeArgs, operation: Operation) -> Result<u8> {
     let node = NodeId::new(args.namespace, args.id)?;
     let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-    let client = args.credentials.connect(
+    let client = args.credentials.with_config(
         &args.endpoint,
         &args.server_uri,
         Duration::from_secs(args.timeout),
+        Client::connect_with,
     )?;
     let (exit_code, document) = runtime.block_on(async {
         let result = operation.execute(&client, &node).await;
@@ -245,74 +281,66 @@ pub(super) fn run(args: NodeArgs, operation: Operation) -> Result<u8> {
     Ok(exit_code)
 }
 
+pub(super) fn preflight(args: &Connection, contract: &Contract) -> Result<()> {
+    args.credentials.check_principal(contract)?;
+    args.credentials.with_config(
+        &args.endpoint,
+        contract.application_uri(),
+        Duration::from_secs(args.timeout.min(60)),
+        |config, options| config.validate(options),
+    )
+}
+
 #[cfg(feature = "cems")]
-pub(super) fn read_meter(args: Connection, client_uri: String, contract: &Contract) -> Result<u8> {
-    let reading = collect(&args, &client_uri, contract, Client::read_meter)?;
+pub(super) fn read_meter(args: Connection, contract: Contract) -> Result<u8> {
+    let reading = collect(args, contract, Client::read_meter)?;
     write_compact_line(&reading, None)?;
     Ok(0)
 }
 
-pub(super) fn snapshot(
-    args: &Connection,
-    client_uri: &str,
-    contract: &Contract,
-) -> Result<Snapshot> {
-    collect(args, client_uri, contract, Client::read_snapshot)
+pub(super) fn snapshot(args: Connection, contract: Contract) -> Result<Snapshot> {
+    collect(args, contract, Client::read_snapshot)
 }
 
-fn collect<T, E: std::error::Error + 'static>(
-    args: &Connection,
-    client_uri: &str,
-    contract: &Contract,
-    operation: impl AsyncFnOnce(&Client, &Contract) -> std::result::Result<T, E>,
+fn collect<T: Send + 'static, E: std::error::Error + 'static>(
+    args: Connection,
+    contract: Contract,
+    operation: impl AsyncFnOnce(&Client, &Contract) -> std::result::Result<T, E> + Send + 'static,
 ) -> Result<T> {
-    if contract.principal() != args.session.principal() {
-        return Err(
-            "contract principal differs from the selected session user (default anonymous)".into(),
-        );
-    }
-    let credentials = Credentials {
-        session: args.session.clone(),
-        client_uri: client_uri.to_owned(),
-        server_cert: args
-            .server_cert
-            .clone()
-            .ok_or("--server-cert is required for native collection")?,
-        client_cert: args
-            .client_cert
-            .clone()
-            .ok_or("--client-cert is required for native collection")?,
-        client_key: args
-            .client_key
-            .clone()
-            .ok_or("--client-key is required for native collection")?,
-    };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
-    let timeout = Duration::from_secs(args.timeout);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let client = credentials.connect(
-        &args.endpoint,
-        contract.application_uri(),
-        timeout.min(Duration::from_secs(60)),
-    )?;
-    let result = runtime
-        .block_on(async {
-            // The synchronous handshake consumes part of the collection budget.
-            let result = if tokio::time::Instant::now() < deadline {
-                tokio::time::timeout_at(deadline, operation(&client, contract))
-                    .await
-                    .ok()
-                    .filter(|_| tokio::time::Instant::now() < deadline)
-            } else {
-                None
+    args.credentials.check_principal(&contract)?;
+    let budget = Duration::from_secs(args.timeout);
+    let started = std::time::Instant::now();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // DNS, handshake and disconnect can block independently of a service timeout.
+    // Only the caller publishes output; the one-shot process exits at its deadline.
+    std::thread::Builder::new()
+        .name("opcua-collection".into())
+        .spawn(move || {
+            let run = || -> Result<T> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()?;
+                let client = args.credentials.with_config(
+                    &args.endpoint,
+                    contract.application_uri(),
+                    budget.min(Duration::from_secs(60)),
+                    Client::connect_with,
+                )?;
+                runtime.block_on(async {
+                    let value = operation(&client, &contract).await;
+                    client.disconnect().await;
+                    Ok(value?)
+                })
             };
-            client.disconnect().await;
-            result
-        })
-        .ok_or("native collection deadline exceeded")??;
-    Ok(result)
+            let _ = sender.send(run().map_err(|error| error.to_string()));
+        })?;
+    match receiver.recv_timeout(budget.saturating_sub(started.elapsed())) {
+        Ok(result) if started.elapsed() < budget => Ok(result?),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("collection worker stopped before returning a result".into())
+        }
+        _ => Err("collection deadline exceeded".into()),
+    }
 }
 
 fn definition_document(definition: VariableDefinition) -> Result<(u8, Value)> {

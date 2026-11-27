@@ -8,6 +8,19 @@ use opcua_kit::{
 
 const UA: &str = "http://opcfoundation.org/UA/";
 
+fn node_id(value: &ua::Variant) -> &ua::NodeId {
+    let ua::Variant::NodeId(node) = value else {
+        panic!("expected NodeId")
+    };
+    node
+}
+fn bytes(value: &ua::Variant) -> &[u8] {
+    let ua::Variant::ByteString(id) = value else {
+        panic!("expected ByteString")
+    };
+    id.value.as_deref().unwrap()
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
@@ -60,30 +73,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert!(refreshed.outputs.is_empty());
     let wait = Duration::from_secs(6);
     let event_type = |event: &[ua::Variant]| {
-        event[0]
-            .as_scalar::<ua::NodeId>()
-            .unwrap()
-            .as_ns0()
-            .unwrap()
+        let node = node_id(&event[0]);
+        assert_eq!(node.namespace, 0);
+        let ua::Identifier::Numeric(id) = node.identifier else {
+            panic!("expected standard numeric event type")
+        };
+        id
     };
     assert_eq!(event_type(&events.next(wait).await?), 2787);
     let alarm = events.next(wait).await?;
     assert_eq!(event_type(&alarm), 2915);
-    let condition = events.stable_node(alarm[2].as_scalar::<ua::NodeId>().unwrap())?;
+    let condition = events.stable_node(node_id(&alarm[2]))?;
     assert_eq!(
         condition,
         NodeId::new("urn:conditions:fixture", "s=MotorAlarm")?
     );
-    let branch = events.stable_node(alarm[3].as_scalar::<ua::NodeId>().unwrap())?;
+    let branch = events.stable_node(node_id(&alarm[3]))?;
     assert_eq!(
         branch,
         NodeId::new("urn:conditions:fixture", "s=OlderBranch")?
     );
-    let first_id = alarm[1]
-        .as_scalar::<ua::ByteString>()
-        .unwrap()
-        .as_bytes()
-        .unwrap();
+    let first_id = bytes(&alarm[1]);
     assert_eq!(event_type(&events.next(wait).await?), 2788);
 
     assert!(matches!(
@@ -122,11 +132,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert_eq!(ack.status, 0);
     let changed = events.next(wait).await?;
     assert_eq!(event_type(&changed), 2915);
-    let current_id = changed[1]
-        .as_scalar::<ua::ByteString>()
-        .unwrap()
-        .as_bytes()
-        .unwrap();
+    let current_id = bytes(&changed[1]);
     assert_ne!(first_id, current_id);
     let stale = control
         .confirm_condition(
@@ -146,11 +152,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     assert!(confirmed.outputs.is_empty());
     assert_eq!(event_type(&events.next(wait).await?), 2915);
     let new_occurrence = events.next(wait).await?;
-    let new_id = new_occurrence[1]
-        .as_scalar::<ua::ByteString>()
-        .unwrap()
-        .as_bytes()
-        .unwrap();
+    let new_id = bytes(&new_occurrence[1]);
     assert_ne!(new_id, current_id);
     let result = control
         .acknowledge_condition(

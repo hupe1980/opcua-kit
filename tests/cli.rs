@@ -97,18 +97,10 @@ fn native_capture_selection_and_scope_fail_before_connecting() {
         "--client-key",
         "key.der",
     ];
-    for (extra, conflict) in [
-        (vec!["--insecure-loopback"], "--insecure-loopback"),
-        (
-            [secure.as_slice(), &["--preflight"]].concat(),
-            "--preflight",
-        ),
-    ] {
-        let result = run(dir, &[base.as_slice(), &extra].concat());
-        exit(&result, 1);
-        assert!(result.stdout.is_empty());
-        assert!(String::from_utf8(result.stderr).unwrap().contains(conflict));
-    }
+    let rejected = run(dir, &[base.as_slice(), &["--insecure-loopback"]].concat());
+    exit(&rejected, 1);
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--insecure-loopback"));
 
     let mut doc: Value =
         serde_json::from_slice(include_bytes!("../fixtures/commissioning/contract.json")).unwrap();
@@ -846,308 +838,42 @@ fn invalid_input_has_bounded_safe_diagnostics_and_no_stdout() {
     exit(&run(&dir, &["--help"]), 0);
 }
 
-#[cfg(unix)]
-mod collector {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn collector_command(dir: &Path, script: &str, extra: &[&str]) -> Command {
-        use std::io::Write;
-        let shim = dir.join("uv");
-        let mut file = fs::File::create(&shim).unwrap();
-        writeln!(file, "#!/bin/sh\n{script}").unwrap();
-        drop(file);
-        fs::set_permissions(shim, fs::Permissions::from_mode(0o700)).unwrap();
-        let mut paths = vec![dir.to_path_buf()];
-        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-        let mut command = Command::new(BIN);
-        command
+#[test]
+fn offline_preflight_rejects_output_and_preserves_inputs() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let contract = include_bytes!("../fixtures/commissioning/contract.json");
+    fs::write(dir.join("contract.json"), contract).unwrap();
+    fs::write(dir.join("saved.json"), b"prior evidence").unwrap();
+    for output in ["saved.json", "new.json"] {
+        let result = Command::new(BIN)
             .current_dir(dir)
+            .env("PATH", "")
             .args([
                 "capture",
+                "--preflight",
                 "--contract",
                 "contract.json",
                 "--endpoint",
                 "opc.tcp://127.0.0.1:4840",
-                "--insecure-loopback",
+                "--server-cert",
+                "pin.der",
+                "--client-cert",
+                "client.der",
+                "--client-key",
+                "key.der",
+                "--output",
+                output,
             ])
-            .args(extra)
-            .env("PATH", std::env::join_paths(paths).unwrap());
-        command
-    }
-
-    fn collector(dir: &Path, script: &str, extra: &[&str]) -> Output {
-        collector_command(dir, script, extra).output().unwrap()
-    }
-
-    fn capture(dir: &Path, script: &str, output: &str) -> Output {
-        collector(dir, script, &["--output", output])
-    }
-
-    // 005-capture-preflight/SR-001 005-capture-preflight/SR-003
-    #[test]
-    fn preflight_runs_offline_and_publishes_only_a_verified_acknowledgement() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        fs::copy(
-            Path::new(FIXTURES).join("contract.json"),
-            dir.join("contract.json"),
-        )
-        .unwrap();
-
-        let shim = r#"
-set -eu
-test "$1" = run
-test "$2" = --offline
-test "$3" = --no-build
-shift 3
-test "$2" = --no-config
-test "$3" = --isolated
-test "$4" = --no-project
-test "$6" = 3.13
-test "$8" = 'asyncua==2.1.0'
-test "$9" = python
-test "${10}" = -I
-test "${11}" = -c
-shift 12
-test "$1" = --endpoint
-test "$2" = opc.tcp://127.0.0.1:4840
-test "$3" = --timeout
-test "$4" = 30
-test "$5" = --insecure-loopback
-test "$6" = --preflight
-test "$#" = 6
-cat > received-contract.json
-echo 'preflight ok'
-"#;
-        let out = collector(dir, shim, &["--preflight"]);
-        exit(&out, 0);
-        assert!(out.stderr.is_empty());
-        assert_eq!(out.stdout, b"Offline capture preparation passed. Run capture without --preflight to test the endpoint.\n");
-        let input: Value =
-            serde_json::from_slice(&fs::read(dir.join("received-contract.json")).unwrap()).unwrap();
-        let expected: Value =
-            serde_json::from_slice(&fs::read(dir.join("contract.json")).unwrap()).unwrap();
-        assert_eq!(input, expected);
-
-        for script in [
-            "exit 0",
-            "printf 'preflight ok'",
-            "echo 'preflight ok'; echo extra",
-            "echo PRIVATE_CANARY",
-            "echo 'preflight ok'; echo PRIVATE_CANARY >&2; exit 1",
-            "echo 'capture: PRIVATE_CANARY' >&2; exit 1",
-        ] {
-            let failed = collector(dir, script, &["--preflight"]);
-            exit(&failed, 1);
-            assert!(failed.stdout.is_empty());
-            let error = String::from_utf8(failed.stderr).unwrap();
-            assert!(!error.contains("PRIVATE_CANARY") && error.len() <= 1024);
-        }
-        for (code, hint) in [
-            (64, "endpoint"),
-            (65, "contract"),
-            (66, "mode"),
-            (67, "regular file"),
-            (68, "expired"),
-            (69, "identity"),
-            (70, "KeyUsage"),
-            (71, "unencrypted"),
-            (72, "does not match"),
-            (73, "configuration"),
-        ] {
-            let script = format!("echo 'capture: PRIVATE_CANARY' >&2; exit {code}");
-            let failed = collector(dir, &script, &["--preflight"]);
-            exit(&failed, 1);
-            assert!(failed.stdout.is_empty());
-            let error = String::from_utf8(failed.stderr).unwrap();
-            assert!(error.contains(hint) && !error.contains("PRIVATE_CANARY"));
-        }
-        let cold = collector(dir, "exit 1", &["--preflight"]);
-        assert!(
-            String::from_utf8(cold.stderr)
-                .unwrap()
-                .contains("uv run --no-config")
-        );
-    }
-
-    // 005-capture-preflight/SR-003
-    #[test]
-    fn preflight_bounds_unfinished_runtime_output() {
-        use std::time::{Duration, Instant};
-
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        fs::copy(
-            Path::new(FIXTURES).join("contract.json"),
-            dir.join("contract.json"),
-        )
-        .unwrap();
-        for script in [
-            // More than a complete frame while the producer stays alive.
-            "printf 'preflight ok\\n!'; exec sleep 6",
-            // A descendant holds the pipe after a successful helper exit.
-            "sleep 6 & printf 'preflight ok\\n'",
-        ] {
-            let start = Instant::now();
-            let failed = collector(dir, script, &["--preflight"]);
-            exit(&failed, 1);
-            assert!(failed.stdout.is_empty());
-            assert!(start.elapsed() < Duration::from_secs(5));
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn check_descendant_cleanup(script: &str, signal: Option<rustix::process::Signal>) {
-        use rustix::process::{Pid, kill_process};
-        use std::time::{Duration, Instant};
-
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        fs::copy(
-            Path::new(FIXTURES).join("contract.json"),
-            dir.join("contract.json"),
-        )
-        .unwrap();
-        // Explicit handshakes ensure that the worker starts before the failure
-        // and can write the marker only after the launcher reports that failure.
-        let shim = format!(
-            r#"
-(
-  touch started
-  for i in $(seq 1 100); do
-    if test -e release; then touch survived; exit 0; fi
-    sleep 0.05
-  done
-) &
-while test ! -e started; do sleep 0.02; done
-{script}
-"#
-        );
-        let child = collector_command(dir, &shim, &["--preflight"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .output()
             .unwrap();
-        if let Some(signal) = signal {
-            let deadline = Instant::now() + Duration::from_secs(4);
-            while !dir.join("started").exists() {
-                assert!(Instant::now() < deadline, "worker failed to start");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            kill_process(Pid::from_child(&child), signal).unwrap();
-        }
-        let failed = child.wait_with_output().unwrap();
-        exit(&failed, 1);
-        assert!(failed.stdout.is_empty());
-        if signal.is_some() {
-            assert!(String::from_utf8_lossy(&failed.stderr).contains("interrupted"));
-        }
-        fs::write(dir.join("release"), "").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            !dir.join("survived").exists(),
-            "worker survived launcher cleanup"
-        );
+        exit(&result, 1);
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("--output"));
     }
-
-    // 005-capture-preflight/SR-003
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn preflight_stops_descendants_before_they_write() {
-        check_descendant_cleanup("printf 'preflight ok\\n!'; exec sleep 4", None);
-        check_descendant_cleanup("echo 'preflight ok'", None);
-    }
-
-    // 005-capture-preflight/SR-003
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn preflight_cancellation_stops_the_runtime_and_its_workers() {
-        use rustix::process::Signal;
-        for signal in [Signal::INT, Signal::TERM] {
-            check_descendant_cleanup("exec sleep 4", Some(signal));
-        }
-    }
-
-    // 005-capture-preflight/SR-003
-    #[test]
-    fn preflight_rejects_invalid_invocations_before_starting_uv() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        fs::copy(
-            Path::new(FIXTURES).join("contract.json"),
-            dir.join("contract.json"),
-        )
-        .unwrap();
-        fs::write(dir.join("saved.json"), b"prior evidence").unwrap();
-        let shim = "touch ran; echo 'preflight ok'";
-
-        for path in ["saved.json", "new.json"] {
-            let out = collector(dir, shim, &["--preflight", "--output", path]);
-            exit(&out, 1);
-            assert!(out.stdout.is_empty());
-            assert!(String::from_utf8(out.stderr).unwrap().contains("--output"));
-        }
-        assert_eq!(fs::read(dir.join("saved.json")).unwrap(), b"prior evidence");
-        assert!(!dir.join("new.json").exists());
-
-        fs::write(dir.join("contract.json"), b"{}").unwrap();
-        let out = collector(dir, shim, &["--preflight"]);
-        exit(&out, 1);
-        assert!(out.stdout.is_empty());
-        assert!(!dir.join("ran").exists());
-    }
-
-    // SR-002 SR-006 SR-007
-    #[test]
-    fn final_artifact_is_replaced_only_after_scope_and_completeness_validation() {
-        let tmp = tempdir().unwrap();
-        let dir = tmp.path();
-        for f in ["contract.json", "before.json"] {
-            fs::copy(Path::new(FIXTURES).join(f), dir.join(f)).unwrap();
-        }
-        fs::write(dir.join("saved.json"), b"previous evidence").unwrap();
-        for script in [
-            "exit 1",
-            "echo '{'",
-            "sed 's/ahu-01/another-device/' before.json",
-            "echo '{\"schemaVersion\":1,\"device\":\"ahu-01\",\"applicationUri\":\"urn:opcua-kit:fixture\",\"principal\":\"anonymous\",\"signals\":[]}'",
-        ] {
-            let out = capture(dir, script, "saved.json");
-            exit(&out, 1);
-            assert!(out.stdout.is_empty());
-            assert_eq!(
-                fs::read(dir.join("saved.json")).unwrap(),
-                b"previous evidence"
-            );
-        }
-        let out = capture(
-            dir,
-            r#"
-set -eu
-test "$1" = run
-test "$3" = --no-config
-test "$4" = --isolated
-test "$5" = --no-project
-test "$9" = 'asyncua==2.1.0'
-test "${10}" = python
-test "${11}" = -I
-test "${12}" = -c
-cat before.json
-"#,
-            "saved.json",
-        );
-        exit(&out, 0);
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            fs::read(dir.join("saved.json")).unwrap(),
-            fs::read(dir.join("before.json")).unwrap()
-        );
-        let before = fs::read(dir.join("contract.json")).unwrap();
-        exit(&capture(dir, "echo ran > unexpected", "./contract.json"), 1);
-        assert!(!dir.join("unexpected").exists());
-        assert_eq!(fs::read(dir.join("contract.json")).unwrap(), before);
-    }
+    assert_eq!(fs::read(dir.join("saved.json")).unwrap(), b"prior evidence");
+    assert_eq!(fs::read(dir.join("contract.json")).unwrap(), contract);
+    assert!(!dir.join("new.json").exists());
 }
 
 // 002-engineering-units/SR-004: Replay the exact unit finding, including unusable Good evidence.

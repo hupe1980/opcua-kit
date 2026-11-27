@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 suite=${1:-protocol}
-features="[]"
+features='["client"]'
 extra_deps=""
 case "$suite" in
   republish) binary=${OPCUA_KIT_REPUBLISH_BIN:-} ;;

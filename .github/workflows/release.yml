@@ -58,9 +58,13 @@ jobs:
             echo "published=$published"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install native build dependencies
-        if: steps.package.outputs.published == 'false'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev
+      - name: Verify the release uses a Rust OPC UA stack
+        run: |
+          cargo tree --locked --all-features --edges normal,build --prefix none --format '{p}' > "$RUNNER_TEMP/opcua-deps"
+          if grep -E '^(open62541(-sys)?|openssl-sys|mbedtls-sys(-auto)?|aws-lc-sys) v' "$RUNNER_TEMP/opcua-deps"; then
+            echo "::error::The release includes a native OPC UA or cryptography dependency."
+            exit 1
+          fi
 
       - name: Exchange GitHub identity for a crates.io token
         if: steps.package.outputs.published == 'false'

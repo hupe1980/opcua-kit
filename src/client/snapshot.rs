@@ -69,21 +69,30 @@ fn protected_signals<'a>(
     if contract.application_uri() != server_uri {
         return Err(SnapshotReadError::ServerIdentity);
     }
-    let mut protected = BTreeSet::new();
-    for (index, signal) in contract.signals().iter().enumerate() {
-        let node = &signal.node;
-        if node.namespace() == "http://opcfoundation.org/UA/"
-            && node
-                .identifier()
-                .strip_prefix("i=")
-                .and_then(|id| id.parse::<u32>().ok())
-                .is_some_and(|id| matches!(id, SERVER_ARRAY | NAMESPACE_ARRAY | MAX_NODES_PER_READ))
-        {
-            return Err(SnapshotReadError::BootstrapNode { index });
+    contract.validate_capture_nodes()?;
+    Ok(contract.signals().iter().map(|s| &s.node).collect())
+}
+
+impl Contract {
+    /// Check that live acquisition will not read application evidence from reserved session bootstrap nodes.
+    /// This can be used before connecting or as part of offline preparation.
+    pub fn validate_capture_nodes(&self) -> Result<(), SnapshotReadError> {
+        for (index, signal) in self.signals().iter().enumerate() {
+            let node = &signal.node;
+            if node.namespace() == "http://opcfoundation.org/UA/"
+                && node
+                    .identifier()
+                    .strip_prefix("i=")
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .is_some_and(|id| {
+                        matches!(id, SERVER_ARRAY | NAMESPACE_ARRAY | MAX_NODES_PER_READ)
+                    })
+            {
+                return Err(SnapshotReadError::BootstrapNode { index });
+            }
         }
-        protected.insert(node);
+        Ok(())
     }
-    Ok(protected)
 }
 
 impl Client {
@@ -91,7 +100,7 @@ impl Client {
     /// The snapshot preserves the contract order and actual operation status, including a
     /// Good status without a value. A missing namespace yields a row with just the identity.
     /// The compact document plus newline is bounded at 4 MiB before appending each row.
-    /// SDK service-response decoding occurs before this application-level output check.
+    /// Service-response decoding occurs before this application-level output check.
     /// ServerArray, NamespaceArray and MaxNodesPerRead are reserved session bootstrap nodes.
     /// Selecting one in the contract fails before the client reads any of those Values.
     ///
@@ -149,7 +158,7 @@ impl Client {
         } else {
             let wire = metadata.namespaces.wire_node(&signal.node, 0)?;
             let raw = self
-                .one_attribute(session, wire, ua::AttributeId::DATATYPE)
+                .one_attribute(session, wire, ua::AttributeId::DataType)
                 .await?;
             decode_data_type(&metadata.namespaces, &raw, quality)?
         };
