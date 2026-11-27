@@ -116,7 +116,8 @@ assert "fixtures/meter/readings.ndjson" in files
 assert not any(f.startswith(("concepts/", "specs/", ".specify/")) for f in files)
 meta = json.loads(cargo("metadata", "--format-version=1", "--no-deps"))
 crate = next(p for p in meta["packages"] if p["name"] == "opcua-kit")
-source = Path(meta["target_directory"], "package", "opcua-kit-" + crate["version"])
+build_directory = meta.get("build_directory", meta["target_directory"])
+source = Path(build_directory, "package", "opcua-kit-" + crate["version"])
 
 with tempfile.TemporaryDirectory() as scratch:
     root = Path(scratch)

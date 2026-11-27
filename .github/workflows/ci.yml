@@ -64,7 +64,7 @@ jobs:
         run: python3 tests/verify_package.py
       - name: Verify event delivery with the registry dependencies in the archive
         run: |
-          archive=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; m=json.load(sys.stdin); p=m["packages"][0]; print("{}/package/{}-{}".format(m["target_directory"],p["name"],p["version"]))')
+          archive=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; m=json.load(sys.stdin); p=m["packages"][0]; print("{}/package/{}-{}".format(m.get("build_directory",m["target_directory"]),p["name"],p["version"]))')
           cd "$archive"
           bash tests/peers/protocol.sh observe
           bash tests/peers/protocol.sh republish
