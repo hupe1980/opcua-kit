@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, btree_map::Entry};
 
 use super::{
     Contract, Duration, Error, Expected, FloatingBits, Instant, JsonObject, MAX_DOCUMENT_BYTES,
-    MeterPoint, MeterProjection, MeterReading, MeterTrace, NodeId, OffsetDateTime, Reading, Window,
-    compact_line_bytes, decode, meter_signal, validate_reading,
+    MeterExclusion, MeterExclusionReason, MeterPoint, MeterProjection, MeterReading, MeterTrace,
+    NodeId, OffsetDateTime, Reading, Window, compact_line_bytes, decode, meter_signal,
+    validate_reading,
 };
 
 // Every minimally encoded wire close already takes over 32 bytes. Check the supplied
@@ -114,6 +115,7 @@ impl<'a> MeterProjector<'a> {
                 skipped_status: 0,
                 skipped_source_time: 0,
                 skipped_precision: 0,
+                first_exclusion: None,
                 outside_window: 0,
                 duplicate_readings: 0,
             },
@@ -143,7 +145,7 @@ impl<'a> MeterProjector<'a> {
             .checked_sub(reading.compact_line_bytes())
         {
             self.remaining_bytes = remaining;
-            self.ingest(&reading.row)
+            self.ingest(&reading.row, self.pushes)
         } else {
             Err(Error::new("meter readings exceed 4 MiB"))
         };
@@ -155,7 +157,7 @@ impl<'a> MeterProjector<'a> {
         })
     }
 
-    fn ingest(&mut self, row: &Reading) -> Result<(), Error> {
+    fn ingest(&mut self, row: &Reading, input_position: usize) -> Result<(), Error> {
         validate_reading(self.contract, self.signal, row)?;
         let result = &mut self.result;
         if row
@@ -165,20 +167,33 @@ impl<'a> MeterProjector<'a> {
             result.outside_window += 1;
             return Ok(());
         }
-        let usable_wh = if row.status != 0 {
-            result.skipped_status += 1;
-            None
-        } else if row.source_at.is_none_or(|at| at > row.received_at) {
-            result.skipped_source_time += 1;
-            None
-        } else if let Some(bits) = row.value_bits {
-            let wh = bits.whole_wh();
-            if wh.is_none() {
-                result.skipped_precision += 1;
+        let eligibility = match row.source_at {
+            _ if row.status != 0 => Err(MeterExclusionReason::Status(row.status)),
+            None => Err(MeterExclusionReason::MissingSourceTime),
+            Some(at) if at > row.received_at => Err(MeterExclusionReason::SourceAfterReceipt),
+            Some(_) => match row.value_bits {
+                Some(bits) => bits.whole_wh().map(Some),
+                None => Ok(row.value),
+            },
+        };
+        let usable_wh = match eligibility {
+            Ok(wh) => wh,
+            Err(reason) => {
+                use MeterExclusionReason::*;
+                match reason {
+                    Status(_) => result.skipped_status += 1,
+                    MissingSourceTime | SourceAfterReceipt => result.skipped_source_time += 1,
+                    NonFiniteWh | NegativeWh | FractionalWh | InsufficientResolution => {
+                        result.skipped_precision += 1;
+                    }
+                }
+                result.first_exclusion.get_or_insert(MeterExclusion {
+                    input_position,
+                    source_at: row.source_at.map(|at| at.0),
+                    reason,
+                });
+                None
             }
-            wh
-        } else {
-            row.value
         };
         if let Some(at) = row.source_at {
             let evidence = Observation {
@@ -234,7 +249,7 @@ impl<'a> MeterProjector<'a> {
     }
 
     /// Supply the independent closes for the meter bound at construction, then
-    /// return its sorted trace and omission counts. An empty slice leaves all closes missing.
+    /// return its sorted trace, omission counts and first exclusion. An empty slice leaves all closes missing.
     /// Each pair is the UTC quarter start (or its offset equivalent) and interval energy
     /// in Wh. Accepts up to 131,072 entries including duplicates. Identical closes coalesce.
     /// The compact trace and its trailing newline must fit in 4 MiB.
@@ -293,7 +308,7 @@ pub fn project_meter_trace(
         }
         // This replay is already bounded by the original physical byte count.
         decode(line, "meter reading")
-            .and_then(|row| projector.ingest(&row))
+            .and_then(|row| projector.ingest(&row, index + 1))
             .map_err(|err| err.at(&format!("readings line {}", index + 1)))?;
     }
     projector.complete()

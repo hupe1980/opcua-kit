@@ -3,8 +3,8 @@
 use opcua_kit::commissioning::{
     Contract, MAX_DOCUMENT_BYTES,
     meter::{
-        MeterProjector, MeterWindow, parse_meter_reading, project_meter_trace,
-        validate_meter_contract,
+        MeterExclusion, MeterExclusionReason, MeterProjector, MeterWindow, parse_meter_reading,
+        project_meter_trace, validate_meter_contract,
     },
     parse_contract,
 };
@@ -102,9 +102,9 @@ fn typed_projection_matches_replay_counters_and_evidence_order() {
     let mut future = float_row(END, 3.5_f32.to_bits());
     future["receivedAt"] = MID.into();
     let rows = [
-        flagged,
         float_row("2026-10-24T00:00:00Z", 0xffc0_0042),
         valid.clone(),
+        flagged,
         untimed,
         future,
         float_row("2026-10-25T00:48:00.000000001Z", 1.25_f32.to_bits()),
@@ -124,6 +124,14 @@ fn typed_projection_matches_replay_counters_and_evidence_order() {
     let direct = cursor.finish(&closes).unwrap();
     for result in [&direct, &replay] {
         assert_eq!(
+            result.first_exclusion,
+            Some(MeterExclusion {
+                input_position: 3,
+                source_at: Some(OffsetDateTime::parse(MID, &Rfc3339).unwrap()),
+                reason: MeterExclusionReason::Status(0x4000),
+            })
+        );
+        assert_eq!(
             (
                 result.skipped_status,
                 result.skipped_source_time,
@@ -138,6 +146,45 @@ fn typed_projection_matches_replay_counters_and_evidence_order() {
         serde_json::to_vec(&direct.trace).unwrap(),
         serde_json::to_vec(&replay.trace).unwrap()
     );
+}
+
+#[test]
+fn first_clock_exclusion_locates_the_physical_line_even_without_source_time() {
+    let contract = contract();
+    let window = bytes(&window());
+    let valid = row(START, 10);
+    let outside = row("2026-10-24T00:00:00Z", 0);
+    let mut capture = ndjson(&[outside, valid.clone(), valid]);
+    assert!(
+        project_meter_trace(&contract, &capture, &window)
+            .unwrap()
+            .first_exclusion
+            .is_none()
+    );
+    capture.extend_from_slice(b"\n \r\n");
+    for (source, reason) in [
+        (Value::Null, MeterExclusionReason::MissingSourceTime),
+        (json!(MID), MeterExclusionReason::SourceAfterReceipt),
+    ] {
+        let mut row = row(MID, 1);
+        row["receivedAt"] = json!(START);
+        row["sourceAt"] = source;
+        let source_at = row["sourceAt"]
+            .as_str()
+            .map(|at| OffsetDateTime::parse(at, &Rfc3339).unwrap());
+        let mut input = capture.clone();
+        input.extend(bytes(&row));
+        let projection = project_meter_trace(&contract, &input, &window).unwrap();
+        assert_eq!(
+            projection.first_exclusion,
+            Some(MeterExclusion {
+                input_position: 5,
+                source_at,
+                reason,
+            })
+        );
+        assert_eq!(projection.skipped_source_time, 1);
+    }
 }
 
 #[test]
@@ -687,6 +734,7 @@ fn float_projection_requires_whole_wh_and_forward_one_wh_resolution() {
         assert_eq!(projected.trace.register.len(), 1);
         assert_eq!(projected.trace.register[0].wh, wh);
         assert_eq!(projected.skipped_precision, 0);
+        assert_eq!(projected.first_exclusion, None);
     }
     for bits in [
         0x0000_0001,
@@ -848,19 +896,20 @@ fn double_projection_requires_exact_wh_below_binary64_resolution_limit() {
         assert_eq!((p.trace.register[0].wh, p.skipped_precision), (expected, 0));
     }
 
-    for bits in [
-        0x0000_0000_0000_0001,
-        0x8000_0000_0000_0001,
-        0x7ff0_0000_0000_0001,
-        0xfff8_0000_0000_0001,
-        f64::INFINITY.to_bits(),
-        f64::NEG_INFINITY.to_bits(),
-        f64::MAX.to_bits(),
-        (-1.0f64).to_bits(),
-        1.0f64.to_bits() + 1,
-        0.5f64.to_bits(),
-        9_007_199_254_740_992.0f64.to_bits(),
-        9_007_199_254_740_994.0f64.to_bits(),
+    use MeterExclusionReason::{FractionalWh, InsufficientResolution, NegativeWh, NonFiniteWh};
+    for (bits, reason) in [
+        (0x0000_0000_0000_0001, FractionalWh),
+        (0x8000_0000_0000_0001, NegativeWh),
+        (0x7ff0_0000_0000_0001, NonFiniteWh),
+        (0xfff8_0000_0000_0001, NonFiniteWh),
+        (f64::INFINITY.to_bits(), NonFiniteWh),
+        (f64::NEG_INFINITY.to_bits(), NonFiniteWh),
+        (f64::MAX.to_bits(), InsufficientResolution),
+        ((-1.0f64).to_bits(), NegativeWh),
+        (1.0f64.to_bits() + 1, FractionalWh),
+        (0.5f64.to_bits(), FractionalWh),
+        (9_007_199_254_740_992.0f64.to_bits(), InsufficientResolution),
+        (9_007_199_254_740_994.0f64.to_bits(), InsufficientResolution),
     ] {
         let raw = bytes(&double_row(MID, bits));
         assert_eq!(
@@ -870,6 +919,7 @@ fn double_projection_requires_exact_wh_below_binary64_resolution_limit() {
         let p = project_meter_trace(&c, &raw, &w).unwrap();
         assert!(p.trace.register.is_empty(), "{bits:016x}");
         assert_eq!(p.skipped_precision, 1);
+        assert_eq!(p.first_exclusion.unwrap().reason, reason);
     }
 }
 

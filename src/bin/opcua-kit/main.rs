@@ -528,7 +528,7 @@ fn run(cli: Cli) -> Result<u8> {
             // a completed save into a failure that prompts an unsafe retry.
             let _ = writeln!(
                 io::stderr().lock(),
-                "Meter trace: {} register points, {} excluded by status, {} without a usable source timestamp, {} excluded by floating-point precision, {} outside the window, {} duplicates.",
+                "Meter trace: {} register points, {} excluded by status, {} without a usable source timestamp, {} excluded for invalid or insufficiently precise whole Wh, {} outside the window, {} duplicates.",
                 result.trace.register.len(),
                 result.skipped_status,
                 result.skipped_source_time,
@@ -536,6 +536,21 @@ fn run(cli: Cli) -> Result<u8> {
                 result.outside_window,
                 result.duplicate_readings,
             );
+            if let Some(exclusion) = result.first_exclusion {
+                let mut stderr = io::stderr().lock();
+                let _ = write!(
+                    stderr,
+                    "First exclusion at readings line {}",
+                    exclusion.input_position
+                );
+                if let Some(source) = exclusion.source_at.and_then(|at| {
+                    at.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }) {
+                    let _ = write!(stderr, " (source {source})");
+                }
+                let _ = writeln!(stderr, ": {}.", exclusion.reason);
+            }
             Ok(0)
         }
     }

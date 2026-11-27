@@ -7,11 +7,11 @@ keywords = "cems energy meter trace cemsd Wh kWh"
 group = "Application guides"
 +++
 
-Use this workflow to compare a cumulative grid-import register with independently closed quarter hours. It has two inputs with different owners. The meter supplies timestamped register readings. The site metering system supplies closed interval energies and the acceptable difference in Wh.
+Compare timestamped readings from a cumulative grid-import register with the energy your site metering system independently recorded for each quarter hour. Both use watt-hours (Wh).
 
 ## Replay a shift offline
 
-Install the meter commands with `cargo install opcua-kit --locked --features cli,cems`. Run the following in a fresh directory. The example and projection run entirely in Rust.
+Install the CLI with `cargo install opcua-kit --locked --features cli,cems`. In a fresh directory, export the Double example and build a trace.
 
 ```sh
 opcua-kit meter example --register-type double --export shift
@@ -19,17 +19,9 @@ opcua-kit meter trace --contract shift/contract.json \
   --window shift/window.json --readings shift/readings.ndjson --output trace.json
 ```
 
-After the export succeeds, run the independent reconciliation with the industrial EMS CLI.
+With the industrial EMS CLI installed, run `cemsd reconcile trace.json`. The register starts at **4,001,000,001 Wh**. Its increases of 285,000 and 275,000 Wh match the independent closes within the 1 Wh tolerance, across Berlin’s repeated local hour. One interior reading is fractional. The diagnostic identifies its line and source time. Use `--register-type float` or `uint64` for the other examples.
 
-```sh
-cemsd reconcile trace.json
-```
-
-The Double example starts at **4,001,000,001 Wh**. It includes one fractional interior observation. The projection reports `1 excluded by floating-point precision` on stderr and preserves the exact whole-Wh boundaries. For a Float or UInt64 meter, choose `--register-type float` or `--register-type uint64` when exporting into a fresh directory.
-
-The shift spans the repeated local hour in Berlin. The first register increase is 285,000 Wh, exactly the independent close. The second is 275,000 Wh against a close of 274,999 Wh. Both quarters meet the example's 1 Wh tolerance. Use the precision and tolerance agreed for your site.
-
-`--output` publishes the complete trace under a new name in an existing directory you control. If the name is occupied, the command exits 1 and preserves the previous file. Choose a fresh name for another run. A named export leaves stdout empty and prints qualification counts on stderr. Omit the option to stream JSON. In scripts, connect the export and reconciliation with `&&` so a failed export cannot start reconciliation on an older trace.
+`--output` writes to a new file. An occupied name exits 1. In scripts, join export and reconciliation with `&&` so a failed export cannot reuse an older trace. Omit `--output` to stream the trace as JSON. Diagnostics go to stderr.
 
 ## Read an approved register
 
@@ -39,7 +31,7 @@ For example, the OPC UA E2 profile assigns different IDs to import (1001) and ex
 
 From the driver’s crate directory, run `cargo add opcua-kit --features client,cems`. Load the contract with `parse_contract` at startup. Open the pinned session with the contract’s `application_uri()` and the approved DER credentials. Reuse the client for each poll. [Open a client session](@/client.md#open-a-session)
 
-The method returns a typed `MeterReading`. If your driver stores NDJSON for later reconciliation, run `cargo add serde_json@1` and pass the resulting line to its writer.
+`client.read_meter(&contract)` returns a typed `MeterReading`. If your driver stores NDJSON for later reconciliation, run `cargo add serde_json@1` and pass the resulting line to its writer.
 
 ```rust
 use opcua_kit::{Client, commissioning::Contract};
@@ -53,7 +45,7 @@ async fn poll_line(client: &Client, contract: &Contract) -> Result<Vec<u8>, Box<
 }
 ```
 
-Check the error when `read_meter` cannot verify the mapping. A mismatch identifies a declaration that differs from the contract. An unverified result means the client lacks evidence, for example when the server denies a unit read. The error names the failed check and preserves its raw status when available. Either outcome stops the operation before the process value is read.
+Before reading the Value, `read_meter` checks the live type, rank and unit. A mismatch identifies a changed declaration. An unverified result identifies missing evidence, such as a denied unit read. The error includes the raw status when available. Metadata and Value are separate requests and can change between reads.
 
 For a field reading, supply the approved server leaf, client certificate and matching unencrypted private key in PEM or DER. The contract identifies the expected server and register.
 
@@ -64,9 +56,7 @@ opcua-kit meter read --contract grid-import.json --endpoint opc.tcp://meter.exam
 
 For a named account, set the contract principal to `username:<account>` and supply `--username` and `--password-file`. The CLI uses the client certificate’s application URI. Its collection deadline includes opening the session and reading the register. You can rehearse the same credentials and endpoint offline. [Capture preflight](@/capture.md#check-the-setup-offline)
 
-Each invocation checks the live type, scalar rank and unit before requesting the register Value. These are separate services, so the device can change between them. A successful read writes one JSON line containing the register identity, raw status, available source and server timestamps, and local receipt time. A Good-severity sample carries the payload shown below. A Bad or Uncertain sample still exits 0 and preserves its status and clocks with no payload. An invalid declaration, failed service or timestamp requiring rounding to nanoseconds exits 1 with empty stdout.
-
-Use one writer per NDJSON file. Retain the original readings with the site records when using them for reconciliation.
+Each successful read writes one NDJSON line with the register identity, raw status, available source and server clocks, and local receipt time. A Good-severity reading includes the payload below. A Bad or Uncertain reading exits 0 with status and clocks only. A failed service, invalid declaration or timestamp requiring rounding exits 1 with empty stdout. Keep the original capture and use one writer per file.
 
 ## Choose a register for reconciliation
 
@@ -80,17 +70,36 @@ Qualify the site’s cumulative register by its declared type and unit. A floati
 
 For a Double, the string is the original 64-bit word, with the most significant digit first. Keep it as text when passing it through JSON tools. For example, `"3ff0000000000000"` represents 1 Wh. For UInt64 `value`, use tooling that preserves 64-bit integers.
 
-At the next value above each floating-point limit, the following representable reading is already two Wh away. If the meter’s Float is past its limit, seek an approved cumulative Double or UInt64 register. The energy companion specification uses *Hp* for Double measurements. Check the accumulation period and reset behavior of the specific point. [OPC Foundation measurement conventions](https://reference.opcfoundation.org/specs/OPC-34100/6.2.2.2)
-
-The precision counter includes otherwise-eligible readings from either floating-point type. The other counters identify out-of-window readings, nonzero status, and missing or future source time, checked in that order. A missing shared boundary affects both adjacent quarters. An excluded **interior** reading leaves a gap between usable points; a successful comparison cannot tell you what the counter did in that gap.
+At 2²⁴ Wh for Float or 2⁵³ Wh for Double, the next representable value is 2 Wh away. If the register has reached that limit, select an approved higher-resolution register. A negative, fractional or non-finite value has a different cause.
 
 ## Supply independent closes
 
-Copy the structure of `shift/window.json`. Set `meter.device`, `meter.applicationUri` and `meter.node` from the reviewed meter mapping when preparing the independent closes. This catches a window accidentally selected for another meter. The site is responsible for correctly assigning that identity to its close source. Set `start` and `end` to offset-bearing quarter boundaries (up to 31 days), `tolerance_wh` to the agreed tolerance and `closed` to an array of `{"at": ..., "wh": ...}` values. Each close is keyed by **interval start**. Keep the independent close source separate from the register. Use an empty array for unavailable closes.
+Use the exported `shift/window.json` as a template.
 
-Run `meter trace` with the reviewed contract, window and site readings. Use `--readings -` to read NDJSON from a pipe. Each input and the output trace must fit within 4 MiB. A projected point requires raw status zero, an in-window source time at or before receipt, and an exact integer. The command preserves usable interior readings so a decrease inside a quarter remains visible. It reports exclusions on stderr. Unavailable source time is never replaced by server or receipt time. At a repeated in-window source instant, conflicting raw statuses, register payloads (including a one-bit difference in either floating-point format) or eligibility fail the projection, even if both records would have been excluded.
+| Field | What to supply |
+| --- | --- |
+| `meter.device`, `meter.applicationUri`, `meter.node` | The identity bound to your independent close feed. It must match the reviewed register. |
+| `start`, `end` | Offset-bearing quarter-hour boundaries up to 31 days apart. Register readings at either boundary are eligible. |
+| `tolerance_wh` | The largest accepted absolute difference in Wh. |
+| `closed` | Independent interval energies as `{"at": ..., "wh": ...}`, keyed by quarter **start**. Use `[]` if unavailable. |
 
-Projection exit 0 means the trace is valid input. **Run `cemsd reconcile` for the interval decision.** Missing boundaries and closes remain absent. A decrease or an out-of-tolerance interval is reported by the reconciler. Preserve the NDJSON alongside the trace to investigate a specific raw status or timestamp. The fixture and encrypted software peer exercise the workflow; qualify the physical meter, counter resolution and site access before relying on its output.
+Pass the contract, window and readings to `meter trace`. Use `--readings -` for stdin. Each input and the compact trace must fit within 4 MiB.
+
+## Interpret an exclusion
+
+Stderr gives the counts and identifies the first rejected observation in input order. For example, a Double encoding −1.0 at the start of this window produces:
+
+```text
+First exclusion at readings line 1 (source 2026-10-25T00:45:00Z): negative cumulative Wh.
+```
+
+Use the one-based line number to locate the original observation, including when its source time is missing. Timed readings outside the window are counted separately. Inside the window, the first failed check determines the reason.
+
+1. **Status** must be exactly zero. The diagnostic preserves all 32 bits in hexadecimal, including flags on Good-severity readings.
+2. **Source time** must be present and at or before receipt. Server and receipt times cannot supply a missing boundary.
+3. **Whole Wh** must be finite, nonnegative, integral and within the wire type’s 1 Wh resolution.
+
+Identical usable readings at one instant coalesce. Conflicting raw statuses, payloads or eligibility at an in-window instant fail the projection. Exit 0 means the trace is ready for `cemsd reconcile`. A missing shared boundary affects both adjacent quarters. Usable interior points can reveal a decrease, while an excluded interior point leaves a gap in coverage.
 
 ## Rehearse a missing boundary
 
@@ -105,7 +114,7 @@ opcua-kit meter trace --contract shift/contract.json --window shift/window.json 
   cemsd reconcile coarse-trace.json
 ```
 
-The projection succeeds and reports two precision exclusions, the fractional interior observation and the coarse shared boundary. The reconciler reports `missing_boundary` for both quarters and exits 1.
+The projection succeeds and counts two whole-Wh exclusions. The first is the fractional interior observation. The second is the coarse shared boundary. The reconciler reports `missing_boundary` for both quarters and exits 1.
 
 ## Build a trace as readings arrive
 
@@ -128,11 +137,11 @@ async fn record_poll(
 }
 ```
 
-After the window ends, call `projector.finish(&closes)?`. Each close is a pair of `(OffsetDateTime, u64)` giving the quarter’s **start** and its independently measured Wh. An empty slice records that no closes were available. The trace includes eligible register observations at either window boundary, keeps interior observations, and sorts points by UTC instant. Use `projection.trace` for reconciliation and the counters on `projection` to explain exclusions. You can inspect `start()`, `end()` and `tolerance_wh()` directly on the trace.
+Call `projector.finish(&closes)?` with `(OffsetDateTime, u64)` pairs giving quarter starts and independently measured Wh. Use an empty slice if closes are unavailable. The returned `projection.trace` contains the register points sorted by UTC instant and exposes `start()`, `end()` and `tolerance_wh()`.
 
-Every push checks the reading’s scope and declared register metadata, including for readings outside the window. A conflicting observation or failed push invalidates that projection. Rebuild the window from retained evidence after correcting the cause. A Bad status is a valid observation that the projector counts and excludes. A read operation that fails before returning a `MeterReading` has supplied nothing to push.
+Use `projection.first_exclusion` for a review. It holds a one-based push number (physical line for NDJSON replay), optional UTC source time, and typed reason. Match `MeterExclusionReason::Status(code)` for the raw `u32`. Outside-window readings and usable duplicates have separate counters.
 
-The typed input budget is 4 MiB, counted using each reading’s compact JSON size plus one newline. Compare `reading.compact_line_bytes()` with `projector.remaining_input_bytes()` to monitor capacity before a push. The cost is cached when the reading is validated. Duplicate, skipped and out-of-window observations all consume budget. For higher-frequency capture, plan shorter aligned windows or replay retained readings into them. The projector retains the facts needed to detect conflicts and qualify points. Keep original readings separately if the site needs a replayable record. A window accepts up to 131,072 supplied closes, including duplicates, and the compact output with its newline must fit in 4 MiB. File replay continues to measure the actual input bytes.
+Every push checks scope and metadata. A failed push invalidates the projection. Correct the cause and replay the retained evidence. To budget a window, compare `reading.compact_line_bytes()` with `projector.remaining_input_bytes()`. Every push counts its compact JSON size plus one newline toward 4 MiB. File replay counts the actual bytes. A window accepts up to 131,072 supplied closes, including duplicates.
 
 Run the offline Rust example from the checkout. Its two quarters span Berlin’s repeated local hour. The output is ready for `cemsd reconcile`.
 
@@ -154,4 +163,4 @@ fn source_clock(contract: &Contract, record: &[u8]) -> Result<Option<OffsetDateT
 }
 ```
 
-For quarter-hour reconciliation, use `project_meter_trace` to apply status, precision and clock checks before consuming its register points. A 100 ns source tick survives the round trip. JSON output uses `Z` and omits trailing fractional zeros. Unknown offsets (`-00:00`), leap seconds and more than nine fractional digits are rejected.
+For quarter-hour reconciliation, use `project_meter_trace` to apply status, whole-Wh and clock checks before consuming its register points. A 100 ns source tick survives the round trip. JSON output uses `Z` and omits trailing fractional zeros. Unknown offsets (`-00:00`), leap seconds and more than nine fractional digits are rejected.

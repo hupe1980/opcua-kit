@@ -50,7 +50,7 @@ cargo install opcua-kit --locked --features cli
 opcua-kit demo --scenario units
 ```
 
-The demo changes a sensor's engineering unit from Celsius to Fahrenheit while its data type stays the same. Exit code 2 means the check detected the mismatch. For a live device, use `capture --preflight` to check the contract and credentials locally before collecting metadata. Install with `--features cli,cems` for meter commands. [Capture guide](https://hupe1980.github.io/opcua-kit/capture/) · [Meter guide](https://hupe1980.github.io/opcua-kit/meter/)
+The demo changes a sensor's engineering unit from Celsius to Fahrenheit while its data type stays the same. Exit code 2 means the check detected the mismatch. For a live device, use `capture --preflight` to check the contract and credentials locally before collecting metadata. For meter commands, install with `--features cli,cems` or use `brew install hupe1980/tap/opcua-kit`. [Capture guide](https://hupe1980.github.io/opcua-kit/capture/) · [Meter guide](https://hupe1980.github.io/opcua-kit/meter/)
 
 ## License
 

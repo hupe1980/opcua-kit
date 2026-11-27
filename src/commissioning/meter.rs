@@ -220,17 +220,23 @@ impl Serialize for FloatingBits {
 }
 
 impl FloatingBits {
-    fn whole_wh(self) -> Option<u64> {
+    fn whole_wh(self) -> Result<u64, MeterExclusionReason> {
         // Widening a binary32 is exact. Each cutoff is the first magnitude at
         // which the next larger value of its original wire type is 2 Wh away.
         let (wh, limit) = match self {
             Self::Float(bits) => (f64::from(f32::from_bits(bits)), 16_777_216.0),
             Self::Double(bits) => (f64::from_bits(bits), 9_007_199_254_740_992.0),
         };
-        if (0.0..limit).contains(&wh) && wh.fract() == 0.0 {
-            Some(wh as u64)
+        if !wh.is_finite() {
+            Err(MeterExclusionReason::NonFiniteWh)
+        } else if wh < 0.0 {
+            Err(MeterExclusionReason::NegativeWh)
+        } else if wh >= limit {
+            Err(MeterExclusionReason::InsufficientResolution)
+        } else if wh.fract() != 0.0 {
+            Err(MeterExclusionReason::FractionalWh)
         } else {
-            None
+            Ok(wh as u64)
         }
     }
 }
@@ -473,6 +479,51 @@ impl MeterTrace {
     }
 }
 
+/// Why an observation failed to qualify as a register point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MeterExclusionReason {
+    /// Nonzero OPC UA StatusCode, including all qualifier and information bits.
+    Status(u32),
+    /// The meter supplied no source timestamp.
+    MissingSourceTime,
+    /// The source instant is later than local receipt.
+    SourceAfterReceipt,
+    /// The floating-point register contains NaN or infinity.
+    NonFiniteWh,
+    /// The cumulative register is finite and below zero.
+    NegativeWh,
+    /// The nonnegative register contains a fraction of a watt-hour.
+    FractionalWh,
+    /// The next larger value in the register's wire type is more than 1 Wh away.
+    InsufficientResolution,
+}
+
+impl fmt::Display for MeterExclusionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(code) => write!(f, "OPC UA status 0x{code:08X}"),
+            Self::MissingSourceTime => f.write_str("missing source timestamp"),
+            Self::SourceAfterReceipt => f.write_str("source timestamp is after receipt"),
+            Self::NonFiniteWh => f.write_str("non-finite register value"),
+            Self::NegativeWh => f.write_str("negative cumulative Wh"),
+            Self::FractionalWh => f.write_str("fractional Wh"),
+            Self::InsufficientResolution => f.write_str("register cannot resolve 1 Wh increments"),
+        }
+    }
+}
+
+/// Location and cause of a single rejected observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MeterExclusion {
+    /// One-based NDJSON line number (including blank lines), or one-based push number.
+    pub input_position: usize,
+    /// Meter source time in UTC, when supplied.
+    pub source_at: Option<OffsetDateTime>,
+    /// The first failed eligibility check for this observation.
+    pub reason: MeterExclusionReason,
+}
+
 /// Result of projecting evidence into a CEMS trace.
 #[derive(Debug)]
 pub struct MeterProjection {
@@ -485,6 +536,9 @@ pub struct MeterProjection {
     /// Otherwise eligible Float or Double rows without a nonnegative whole Wh
     /// value below the original type's 1 Wh resolution limit (2²⁴ or 2⁵³).
     pub skipped_precision: usize,
+    /// First observation in input order counted by any of the three `skipped_*` counters.
+    /// Outside-window observations and usable duplicates do not set this field.
+    pub first_exclusion: Option<MeterExclusion>,
     /// Timed rows outside the requested window (regardless of status).
     pub outside_window: usize,
     /// Additional usable rows with the same source instant and exact value.

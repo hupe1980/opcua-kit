@@ -96,6 +96,7 @@ fn project_register_and_independent_closes_through_file_or_pipe() {
         assert_eq!(result.stdout.last(), Some(&b'\n'));
     }
     assert_eq!(stream.stdout, saved.stdout);
+    assert!(!String::from_utf8_lossy(&stream.stderr).contains("First exclusion"));
     let output: Value = serde_json::from_slice(&stream.stdout).unwrap();
     assert_eq!(output.as_object().unwrap().len(), 5);
     assert_eq!(output["register"][0]["wh"], 982);
@@ -111,7 +112,9 @@ fn project_register_and_independent_closes_through_file_or_pipe() {
     let output: Value = serde_json::from_slice(&gap.stdout).unwrap();
     assert_eq!(output["register"].as_array().unwrap().len(), 1);
     assert_eq!(output["closed"][0]["wh"], 100);
-    assert!(String::from_utf8_lossy(&gap.stderr).contains("1 excluded by status"));
+    let diagnostic = String::from_utf8_lossy(&gap.stderr);
+    assert!(diagnostic.contains("1 excluded by status"));
+    assert!(diagnostic.contains("First exclusion at readings line 2 (source 2026-10-25T01:00:00Z): OPC UA status 0x80340000."));
 }
 
 // 006-meter-pilot/SR-002 006-meter-pilot/SR-003
@@ -184,7 +187,8 @@ fn float_example_counts_precision_and_rejects_conflicting_payloads() {
     let out = piped(&dir, readings.as_bytes());
     exit(&out, 0);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("1 excluded by floating-point precision")
+        String::from_utf8_lossy(&out.stderr)
+            .contains("1 excluded for invalid or insufficiently precise whole Wh")
     );
     let output: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
@@ -220,12 +224,26 @@ fn double_example_preserves_large_odd_wh_and_refuses_malformed_hex() {
     let out = trace(&dir, "readings.ndjson").output().unwrap();
     exit(&out, 0);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("1 excluded by floating-point precision")
+        String::from_utf8_lossy(&out.stderr)
+            .contains("1 excluded for invalid or insufficiently precise whole Wh")
     );
     let trace: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(trace["register"][0]["wh"], 4_001_000_001u64);
 
     let records = fs::read_to_string(dir.join("readings.ndjson")).unwrap();
+    let mut negative: Value = serde_json::from_str(records.lines().next().unwrap()).unwrap();
+    negative["valueBits"] = json!("bff0000000000000");
+    let out = piped(&dir, negative.to_string().as_bytes());
+    exit(&out, 0);
+    let projected: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(projected["register"], json!([]));
+    assert_eq!(projected["closed"], trace["closed"]);
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert!(diagnostic.contains("1 excluded for invalid or insufficiently precise whole Wh"));
+    assert!(diagnostic.contains(
+        "First exclusion at readings line 1 (source 2026-10-25T00:45:00Z): negative cumulative Wh."
+    ));
+
     let mut malformed: Value = serde_json::from_str(records.lines().last().unwrap()).unwrap();
     malformed["valueBits"] = json!(42);
     exit(
